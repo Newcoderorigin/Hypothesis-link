@@ -127,6 +127,21 @@ class AIChatSession:
                 return reply
             else:
                 return "[Error] No valid response received."
+        improved_prompt = self.feedback_layer.improve_prompt(user_input)
+        if improved_prompt:
+            console.print(f"[cyan]Enhanced prompt applied.[/cyan]")
+        self.add_message("user", improved_prompt or user_input)
+
+        response_data = send_chat_completion(self.messages)
+        if response_data:
+            reply = format_response(response_data)
+            self.add_message("assistant", reply)
+            # Learn from interaction
+            loss = self.feedback_layer.learn_from_interaction(user_input, reply)
+            console.print(f"[dim]Tavonic learning loss: {loss:.6f}[/dim]")
+            return reply
+        else:
+            return "[Error] No valid response received."
 
 
 # -------------------------------
@@ -155,6 +170,9 @@ class AIChatGUI:
         tk.Button(self.button_frame, text="Clear", command=self.clear_chat).pack(side=tk.LEFT, padx=5)
         tk.Button(self.button_frame, text="Quit", command=self.master.quit).pack(side=tk.LEFT, padx=5)
         self._request_in_progress = False
+        tk.Button(self.button_frame, text="Send", command=self.send_message).pack(side=tk.LEFT, padx=5)
+        tk.Button(self.button_frame, text="Clear", command=self.clear_chat).pack(side=tk.LEFT, padx=5)
+        tk.Button(self.button_frame, text="Quit", command=self.master.quit).pack(side=tk.LEFT, padx=5)
 
     def clear_chat(self):
         self.chat_display.configure(state='normal')
@@ -193,6 +211,15 @@ class AIChatGUI:
         self.display_message(message, color)
         self._request_in_progress = False
         self.send_button.config(state=tk.NORMAL)
+        reply = self.chat_session.query_model(user_input)
+        self.master.after(
+            0, lambda: self.display_message(f"Assistant: {reply}\n\n", 'green')
+        )
+        threading.Thread(target=self.get_response, args=(user_input,)).start()
+
+    def get_response(self, user_input):
+        reply = self.chat_session.query_model(user_input)
+        self.display_message(f"Assistant: {reply}\n\n", 'green')
 
     def display_message(self, message, color):
         self.chat_display.configure(state='normal')

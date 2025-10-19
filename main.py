@@ -175,6 +175,11 @@ class AIChatGUI:
         self.master.after(
             0, lambda: self.display_message(f"Assistant: {reply}\n\n", 'green')
         )
+        threading.Thread(target=self.get_response, args=(user_input,)).start()
+
+    def get_response(self, user_input):
+        reply = self.chat_session.query_model(user_input)
+        self.display_message(f"Assistant: {reply}\n\n", 'green')
 
     def display_message(self, message, color):
         self.chat_display.configure(state='normal')

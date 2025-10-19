@@ -164,6 +164,17 @@ class AIChatGUI:
             return
         self.user_entry.delete(0, tk.END)
         self.display_message(f"You: {user_input}\n", 'blue')
+        threading.Thread(
+            target=self._get_response_worker,
+            args=(user_input,),
+            daemon=True,
+        ).start()
+
+    def _get_response_worker(self, user_input):
+        reply = self.chat_session.query_model(user_input)
+        self.master.after(
+            0, lambda: self.display_message(f"Assistant: {reply}\n\n", 'green')
+        )
         threading.Thread(target=self.get_response, args=(user_input,)).start()
 
     def get_response(self, user_input):

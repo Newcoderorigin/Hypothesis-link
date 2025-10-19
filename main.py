@@ -105,11 +105,28 @@ class AIChatSession:
     def __init__(self):
         self.messages = []
         self.feedback_layer = TavonicCognitiveLayer()
+        self._lock = threading.Lock()
 
     def add_message(self, role, content):
         self.messages.append({"role": role, "content": content})
 
     def query_model(self, user_input):
+        with self._lock:
+            improved_prompt = self.feedback_layer.improve_prompt(user_input)
+            if improved_prompt:
+                console.print(f"[cyan]Enhanced prompt applied.[/cyan]")
+            self.add_message("user", improved_prompt or user_input)
+
+            response_data = send_chat_completion(self.messages)
+            if response_data:
+                reply = format_response(response_data)
+                self.add_message("assistant", reply)
+                # Learn from interaction
+                loss = self.feedback_layer.learn_from_interaction(user_input, reply)
+                console.print(f"[dim]Tavonic learning loss: {loss:.6f}[/dim]")
+                return reply
+            else:
+                return "[Error] No valid response received."
         improved_prompt = self.feedback_layer.improve_prompt(user_input)
         if improved_prompt:
             console.print(f"[cyan]Enhanced prompt applied.[/cyan]")
@@ -148,6 +165,11 @@ class AIChatGUI:
 
         self.button_frame = tk.Frame(master)
         self.button_frame.pack(pady=5)
+        self.send_button = tk.Button(self.button_frame, text="Send", command=self.send_message)
+        self.send_button.pack(side=tk.LEFT, padx=5)
+        tk.Button(self.button_frame, text="Clear", command=self.clear_chat).pack(side=tk.LEFT, padx=5)
+        tk.Button(self.button_frame, text="Quit", command=self.master.quit).pack(side=tk.LEFT, padx=5)
+        self._request_in_progress = False
         tk.Button(self.button_frame, text="Send", command=self.send_message).pack(side=tk.LEFT, padx=5)
         tk.Button(self.button_frame, text="Clear", command=self.clear_chat).pack(side=tk.LEFT, padx=5)
         tk.Button(self.button_frame, text="Quit", command=self.master.quit).pack(side=tk.LEFT, padx=5)
@@ -159,11 +181,16 @@ class AIChatGUI:
         self.chat_display.configure(state='disabled')
 
     def send_message(self, event=None):
+        if self._request_in_progress:
+            return
+
         user_input = self.user_entry.get().strip()
         if not user_input:
             return
         self.user_entry.delete(0, tk.END)
         self.display_message(f"You: {user_input}\n", 'blue')
+        self._request_in_progress = True
+        self.send_button.config(state=tk.DISABLED)
         threading.Thread(
             target=self._get_response_worker,
             args=(user_input,),
@@ -171,6 +198,19 @@ class AIChatGUI:
         ).start()
 
     def _get_response_worker(self, user_input):
+        try:
+            reply = self.chat_session.query_model(user_input)
+        except Exception as exc:
+            console.print(f"[red]Background request failed:[/red] {exc}")
+            reply = "[Error] Request failed. Check logs for details."
+        self.master.after(
+            0, lambda: self._display_and_release(f"Assistant: {reply}\n\n", 'green')
+        )
+
+    def _display_and_release(self, message, color):
+        self.display_message(message, color)
+        self._request_in_progress = False
+        self.send_button.config(state=tk.NORMAL)
         reply = self.chat_session.query_model(user_input)
         self.master.after(
             0, lambda: self.display_message(f"Assistant: {reply}\n\n", 'green')

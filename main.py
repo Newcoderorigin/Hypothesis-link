@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Iterable, List, MutableMapping, Optional, Tuple, Union
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 if importlib.util.find_spec("requests") is not None:
     import requests  # type: ignore[assignment]
@@ -373,7 +373,8 @@ class AppConfig:
             raise ConfigurationError("Temperature must be between 0.0 and 2.0")
         if self.max_tokens is not None and self.max_tokens < 1:
             raise ConfigurationError("max_tokens must be a positive integer when provided")
-        LMStudioEndpoints(self.api_base_url)
+        endpoints = LMStudioEndpoints(self.api_base_url)
+        self.api_base_url = endpoints.base_url
 
 
 @dataclass(slots=True)
@@ -381,6 +382,7 @@ class LMStudioEndpoints:
     """Utility helper that exposes the canonical LM Studio REST endpoints."""
 
     base_url: str
+    _prefix: str = field(init=False, repr=False, default="")
 
     _PATHS: ClassVar[Dict[str, str]] = {
         "chat_completions": "/v1/chat/completions",
@@ -409,16 +411,33 @@ class LMStudioEndpoints:
         if parsed.query or parsed.fragment:
             raise ConfigurationError("API base URL must not contain query parameters")
 
-        path = parsed.path.rstrip("/")
-        normalised = f"{parsed.scheme}://{parsed.netloc}{path}"
-        self.base_url = normalised.rstrip("/")
+        raw_path = re.sub(r"/+$", "", parsed.path or "")
+        prefix = raw_path
+        for candidate in self._PATHS.values():
+            trimmed_candidate = candidate.rstrip("/")
+            if trimmed_candidate and prefix.endswith(trimmed_candidate):
+                prefix = prefix[: -len(trimmed_candidate)]
+                prefix = re.sub(r"/+$", "", prefix)
+                break
+
+        if prefix.endswith("/v1"):
+            prefix = prefix[: -len("/v1")]
+            prefix = re.sub(r"/+$", "", prefix)
+
+        self._prefix = prefix  # store for diagnostics
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        if prefix:
+            base += prefix
+        self.base_url = base.rstrip("/")
 
     def url_for(self, endpoint: str) -> str:
         try:
             path = self._PATHS[endpoint]
         except KeyError as exc:  # pragma: no cover - defensive guard
             raise ConfigurationError(f"Unknown LM Studio endpoint: {endpoint}") from exc
-        return urljoin(f"{self.base_url}/", path)
+        if not path.startswith("/"):
+            path = f"/{path}"
+        return f"{self.base_url}{path}"
 
     def as_dict(self) -> Dict[str, str]:
         return {name: self.url_for(name) for name in self._PATHS}

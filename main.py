@@ -835,7 +835,12 @@ class SecureHTTPClient:
                 LOGGER.debug("Received response in %.2fs", duration)
                 return reply
             except (requests.Timeout, requests.ConnectionError) as exc:
-                self._metrics.record(time.perf_counter() - start, success=False)
+                duration = time.perf_counter() - start
+                self._metrics.record(duration, success=False)
+                reason = f"Network failure contacting language model: {exc}"
+                if self._maybe_failover_to_offline(reason):
+                    retries = 0
+                    continue
                 if retries >= self._config.max_retries:
                     if self._maybe_failover_to_offline(
                         f"Network failure contacting language model: {exc}"

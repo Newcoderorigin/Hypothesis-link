@@ -23,7 +23,9 @@ liberally documented, making it straightforward to audit or extend.
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
+import importlib.util
 import json
 import logging
 import os
@@ -31,17 +33,91 @@ import queue
 import random
 import re
 import statistics
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, ClassVar, Dict, Iterable, List, MutableMapping, Optional, Tuple
+from typing import Any, ClassVar, Dict, Iterable, List, MutableMapping, Optional, Tuple, Union
 from urllib.parse import urljoin, urlparse
 
-import requests
-from requests import Response
-from rich.console import Console
+if importlib.util.find_spec("requests") is not None:
+    import requests  # type: ignore[assignment]
+    from requests import Response
+    REQUESTS_AVAILABLE = True
+else:  # pragma: no cover - offline fallback when requests is unavailable
+    REQUESTS_AVAILABLE = False
+
+    class Response:  # type: ignore[override]
+        """Lightweight stand-in for :class:`requests.Response`."""
+
+        def __init__(self, status_code: int = 0) -> None:
+            self.status_code = status_code
+            self.ok = 200 <= status_code < 300
+
+
+    class _RequestsRequestException(RuntimeError):
+        """Fallback hierarchy mirroring requests' exception structure."""
+
+
+    class _RequestsHTTPError(_RequestsRequestException):
+        def __init__(self, message: str = "", response: Optional[Response] = None) -> None:
+            super().__init__(message)
+            self.response = response
+
+
+    class _RequestsTimeout(_RequestsRequestException):
+        pass
+
+
+    class _RequestsConnectionError(_RequestsRequestException):
+        pass
+
+
+    class _OfflineNetworkUnavailable(RuntimeError):
+        """Raised when attempting network IO without the requests dependency."""
+
+
+    class _OfflineRequestsSession:
+        def __init__(self) -> None:
+            self.headers: Dict[str, str] = {}
+
+        def close(self) -> None:
+            return None
+
+        def post(self, *args: Any, **kwargs: Any) -> "Response":
+            raise _OfflineNetworkUnavailable(
+                "The 'requests' package is required for network access."
+            )
+
+        def get(self, *args: Any, **kwargs: Any) -> "Response":
+            raise _OfflineNetworkUnavailable(
+                "The 'requests' package is required for network access."
+            )
+
+
+    class _OfflineRequestsModule:
+        Session = _OfflineRequestsSession
+        Timeout = _RequestsTimeout
+        ConnectionError = _RequestsConnectionError
+        HTTPError = _RequestsHTTPError
+        RequestException = _RequestsRequestException
+
+
+    requests = _OfflineRequestsModule()  # type: ignore[assignment]
+
+
+if importlib.util.find_spec("rich") is not None:
+    from rich.console import Console
+else:  # pragma: no cover - graceful degradation when rich is unavailable
+
+    class Console:  # type: ignore[override]
+        """Minimal substitute for :class:`rich.console.Console`."""
+
+        def print(self, message: str) -> None:
+            cleaned = re.sub(r"\[/?[a-zA-Z0-9_\s-]+\]", "", message)
+            print(cleaned)
 
 try:
     import tkinter as tk
@@ -477,8 +553,21 @@ class PersistentHistoryStore:
             raise ChatStorageError("History file is corrupted") from exc
         return [ChatMessage.from_dict(item) for item in data]
 
-    def save(self, messages: Iterable[ChatMessage]) -> None:
-        serialised = [msg.to_dict() for msg in messages]
+    def save(self, messages: Iterable[Union[ChatMessage, MutableMapping[str, Any]]]) -> None:
+        serialised: List[Dict[str, Any]] = []
+        for item in messages:
+            if isinstance(item, ChatMessage):
+                serialised.append(item.to_dict())
+            elif isinstance(item, MutableMapping):
+                snapshot = dict(item)
+                timestamp = snapshot.get("timestamp")
+                if isinstance(timestamp, datetime):
+                    snapshot["timestamp"] = timestamp.isoformat()
+                serialised.append(snapshot)
+            else:  # pragma: no cover - defensive guard
+                raise ChatStorageError(
+                    f"Unsupported history entry type: {type(item)!r}"
+                )
         tmp_path = self._path.with_suffix(".tmp")
         with self._lock:
             try:
@@ -493,34 +582,35 @@ class PersistentHistoryStore:
 
 
 class PromptEnhancer:
+    """A prompt handler that preserves user intent for the language model."""
     """A deterministic, lightweight prompt improvement engine."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._observed_keywords: Dict[str, int] = {}
-        self._max_keywords = 64
+        self._last_prompt: Optional[str] = None
+        self._last_response: Optional[str] = None
 
-    def enhance(self, prompt: str, context: ConversationHistory) -> str:
-        prompt = InputSanitiser.sanitise(prompt)
+    def enhance(self, prompt: str, context: ConversationHistory) -> str:  # noqa: D401
+        """Return the sanitised prompt without modifying its semantics."""
+
+        sanitised = InputSanitiser.sanitise(prompt)
         with self._lock:
-            baseline = prompt
-            baseline = self._ensure_punctuation(baseline)
-            baseline = self._normalise_whitespace(baseline)
-            baseline = self._augment_with_context(baseline, context)
-            self._remember_keywords(baseline)
-            enriched = self._add_quality_instructions(baseline)
-            return enriched
+            self._last_prompt = sanitised
+            self._last_response = None
+        return sanitised
 
-    @staticmethod
-    def _ensure_punctuation(text: str) -> str:
-        if text and text[-1].isalnum():
-            return text + "."
-        return text
+    def register_feedback(self, prompt: str, response: str) -> None:
+        with self._lock:
+            self._last_prompt = prompt
+            self._last_response = response
 
-    @staticmethod
-    def _normalise_whitespace(text: str) -> str:
-        return re.sub(r"\s+", " ", text)
+    def last_exchange(self) -> Optional[Tuple[str, Optional[str]]]:
+        """Expose the most recent prompt/response pair for diagnostics."""
 
+        with self._lock:
+            if self._last_prompt is None:
+                return None
+            return (self._last_prompt, self._last_response)
     def _augment_with_context(self, text: str, context: ConversationHistory) -> str:
         summary_terms: List[str] = []
         for message in reversed(context.export()):
@@ -590,12 +680,23 @@ class PromptEnhancer:
 class SecureHTTPClient:
     """Handles communication with the language model backend."""
 
-    def __init__(self, config: AppConfig, metrics: MetricsTracker, limiter: RateLimiter) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        metrics: MetricsTracker,
+        limiter: RateLimiter,
+        session: Optional[Any] = None,
+    ) -> None:
         self._config = config
         self._metrics = metrics
         self._limiter = limiter
-        self._session = requests.Session()
-        self._session.headers.update({"Content-Type": "application/json"})
+        self._session = session or requests.Session()
+        if not hasattr(self._session, "headers"):
+            self._session.headers = {}
+        try:
+            self._session.headers.update({"Content-Type": "application/json"})
+        except AttributeError:  # pragma: no cover - highly defensive
+            self._session.headers["Content-Type"] = "application/json"
         self._lock = threading.Lock()
         self._endpoints = LMStudioEndpoints(config.api_base_url)
 
@@ -616,6 +717,7 @@ class SecureHTTPClient:
             start = time.perf_counter()
             try:
                 response = self._session.post(
+                    self._endpoints.url_for("chat_completions"),
                     self._endpoints.chat_completions,
                     json=payload,
                     timeout=self._config.timeout,
@@ -655,7 +757,7 @@ class SecureHTTPClient:
         start = time.perf_counter()
         try:
             response = self._session.get(
-                self._endpoints.models,
+                self._endpoints.url_for("models"),
                 timeout=self._config.timeout,
                 verify=self._config.verify_tls,
             )
@@ -681,7 +783,7 @@ class SecureHTTPClient:
     def check_health(self) -> bool:
         try:
             response = self._session.get(
-                self._endpoints.health,
+                self._endpoints.url_for("health"),
                 timeout=min(self._config.timeout, 5.0),
                 verify=self._config.verify_tls,
             )
@@ -719,6 +821,88 @@ class SecureHTTPClient:
         except (KeyError, IndexError, AttributeError) as exc:
             raise ResponseFormatError("Unexpected response structure from backend") from exc
 
+
+class OfflineResponse(Response):
+    """Response surrogate used by the offline model simulator."""
+
+    def __init__(self, status_code: int, payload: Any) -> None:
+        super().__init__()
+        self._payload = payload
+        self.status_code = status_code
+        self.ok = 200 <= status_code < 300
+
+    def json(self) -> Any:
+        return json.loads(json.dumps(self._payload))
+
+    def raise_for_status(self) -> None:
+        if not self.ok:
+            raise requests.HTTPError(
+                f"Offline simulator returned HTTP {self.status_code}", response=self
+            )
+
+
+class OfflineModelSimulator:
+    """In-memory LM Studio surrogate for offline tests."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._models = ["offline-simulator"]
+        self._history: List[Dict[str, str]] = []
+
+    def dispatch(self, method: str, url: str, payload: Optional[Dict[str, Any]]) -> OfflineResponse:
+        path = urlparse(url).path
+        if method == "POST" and path.endswith("/chat/completions"):
+            return self._handle_chat_completion(payload or {})
+        if method == "GET" and path.endswith("/models"):
+            return OfflineResponse(200, {"data": [{"id": model} for model in self._models]})
+        if method == "GET" and path.endswith("/health"):
+            return OfflineResponse(200, {"status": "ok"})
+        return OfflineResponse(404, {"error": "Unsupported offline endpoint", "path": path})
+
+    def _handle_chat_completion(self, payload: Dict[str, Any]) -> OfflineResponse:
+        messages = payload.get("messages") or []
+        if not messages:
+            return OfflineResponse(400, {"error": "messages payload is required"})
+        prompt = str(messages[-1].get("content", ""))
+        with self._lock:
+            self._history.append({"role": "user", "content": prompt})
+            response_text = f"offline-response::{prompt}"
+            self._history.append({"role": "assistant", "content": response_text})
+        return OfflineResponse(
+            200,
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": response_text,
+                        }
+                    }
+                ]
+            },
+        )
+
+    @property
+    def history(self) -> List[Dict[str, str]]:
+        with self._lock:
+            return list(self._history)
+
+
+class OfflineSession:
+    """requests.Session compatible stub for offline diagnostics."""
+
+    def __init__(self) -> None:
+        self.headers: Dict[str, str] = {}
+        self._simulator = OfflineModelSimulator()
+
+    def close(self) -> None:
+        return None
+
+    def post(self, url: str, json: Dict[str, Any], timeout: float, verify: bool) -> OfflineResponse:
+        return self._simulator.dispatch("POST", url, json)
+
+    def get(self, url: str, timeout: float, verify: bool) -> OfflineResponse:
+        return self._simulator.dispatch("GET", url, None)
 
 class ChatOrchestrator:
     """Encapsulates the end-to-end logic for running a chat session."""
@@ -1384,6 +1568,72 @@ class ChatGUI:
 # ---------------------------------------------------------------------------
 
 
+def run_offline_self_test(rounds: int = 3) -> None:
+    """Execute an offline send/receive diagnostic without network access."""
+
+    CONSOLE.print("[bold cyan]Starting offline self-test…[/bold cyan]")
+
+    config = AppConfig(
+        api_base_url="http://offline.local",
+        model_name="offline-simulator",
+        timeout=5.0,
+        max_retries=1,
+        request_backoff=1.5,
+        history_limit=8,
+        rate_limit_per_minute=120,
+        verify_tls=False,
+    )
+    config.validate()
+
+    metrics = MetricsTracker()
+    limiter = RateLimiter(config.rate_limit_per_minute)
+    history = ConversationHistory(config.history_limit)
+    temp_history_path = Path(tempfile.gettempdir()) / "hypothesis_link_offline_history.json"
+    store = PersistentHistoryStore(temp_history_path)
+    enhancer = PromptEnhancer()
+    client = SecureHTTPClient(config, metrics, limiter, session=OfflineSession())
+    orchestrator = ChatOrchestrator(config, history, store, enhancer, client, metrics)
+
+    try:
+        endpoints = orchestrator.endpoints()
+        CONSOLE.print(
+            "[bold green]Offline endpoints available:[/bold green] "
+            + ", ".join(sorted(endpoints))
+        )
+
+        required_endpoints = {"chat_completions", "models", "health"}
+        missing = required_endpoints.difference(endpoints)
+        if missing:
+            raise RuntimeError(f"Offline simulator is missing endpoints: {sorted(missing)}")
+
+        if not orchestrator.health_status():
+            raise RuntimeError("Offline simulator reported an unhealthy status")
+
+        models = orchestrator.available_models()
+        if not models:
+            raise RuntimeError("Offline simulator returned no models")
+        CONSOLE.print(
+            "[bold green]Offline models detected:[/bold green] " + ", ".join(models)
+        )
+
+        for idx in range(rounds):
+            prompt = f"offline diagnostic round {idx + 1}"
+            response = orchestrator.submit_user_message(prompt)
+            if prompt not in response:
+                raise RuntimeError(
+                    "Offline simulator response did not echo the supplied prompt"
+                )
+            CONSOLE.print(
+                f"[cyan]Prompt:[/cyan] {prompt!r} -> [magenta]Response:[/magenta] {response!r}"
+            )
+
+        CONSOLE.print("[bold cyan]Offline self-test completed successfully.[/bold cyan]")
+    finally:
+        orchestrator.shutdown()
+        temp_history_path.unlink(missing_ok=True)
+
+
+
 def build_application() -> ChatGUI:
     paths = AppPaths()
     config = AppConfig.from_env(paths)
@@ -1398,7 +1648,24 @@ def build_application() -> ChatGUI:
     return gui
 
 
-def main() -> None:  # pragma: no cover - entry point
+def main(argv: Optional[List[str]] = None) -> None:  # pragma: no cover - entry point
+    parser = argparse.ArgumentParser(description="Hypothesis-link desktop client")
+    parser.add_argument(
+        "--offline-self-test",
+        action="store_true",
+        help="run the built-in offline send/receive diagnostic and exit",
+    )
+    args = parser.parse_args(argv)
+
+    if args.offline_self_test:
+        try:
+            run_offline_self_test()
+        except Exception as exc:  # pragma: no cover - diagnostic failure surface
+            LOGGER.exception("Offline self-test failed")
+            CONSOLE.print(f"[bold red]Offline self-test failed:[/bold red] {exc}")
+            raise
+        return
+
     try:
         app = build_application()
     except ConfigurationError as exc:

@@ -287,6 +287,17 @@ class LMStudioEndpoints:
     def as_dict(self) -> Dict[str, str]:
         return {name: self.url_for(name) for name in self._PATHS}
 
+    def __getattr__(self, item: str) -> str:
+        """Allow attribute-style access to the canonical endpoint URLs."""
+
+        try:
+            return self.url_for(item)
+        except ConfigurationError as exc:
+            raise AttributeError(item) from exc
+
+    def __dir__(self) -> List[str]:
+        return sorted({*super().__dir__(), *self._PATHS.keys()})
+
 
 # ---------------------------------------------------------------------------
 # Metrics and analytics support

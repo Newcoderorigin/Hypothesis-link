@@ -728,7 +728,6 @@ class SecureHTTPClient:
             try:
                 response = self._session.post(
                     self._endpoints.url_for("chat_completions"),
-                    self._endpoints.chat_completions,
                     json=payload,
                     timeout=self._config.timeout,
                     verify=self._config.verify_tls,
@@ -757,7 +756,22 @@ class SecureHTTPClient:
             except requests.HTTPError as exc:
                 self._metrics.record(time.perf_counter() - start, success=False)
                 status = exc.response.status_code if isinstance(exc.response, Response) else None
-                raise APIError(f"Language model returned HTTP {status}") from exc
+                detail = self._summarise_http_error(exc.response)
+                if status in {400, 404} and self._should_retry_model_refresh(detail):
+                    retries += 1
+                    if retries > self._config.max_retries:
+                        raise APIError(detail or f"Language model returned HTTP {status}") from exc
+                    LOGGER.warning(
+                        "Backend rejected request (%s). Attempting model refresh (%d/%d).",
+                        status,
+                        retries,
+                        self._config.max_retries,
+                    )
+                    if not self._refresh_active_model():
+                        raise APIError(detail or f"Language model returned HTTP {status}") from exc
+                    time.sleep(min(backoff**retries, 5.0))
+                    continue
+                raise APIError(detail or f"Language model returned HTTP {status}") from exc
             except ValueError as exc:
                 self._metrics.record(time.perf_counter() - start, success=False)
                 raise ResponseFormatError("Malformed JSON received from backend") from exc
@@ -800,6 +814,80 @@ class SecureHTTPClient:
             return response.ok
         except requests.RequestException:
             return False
+
+    def _refresh_active_model(self) -> bool:
+        """Refresh the cached model list and select a valid model if needed."""
+
+        try:
+            models = self.list_models()
+        except APIError as exc:
+            LOGGER.warning("Unable to refresh models after backend rejection: %s", exc)
+            return False
+
+        if not models:
+            LOGGER.warning("Model refresh succeeded but returned no candidates")
+            return False
+
+        if self._config.model_name in models:
+            return True
+
+        selected = models[0]
+        LOGGER.info(
+            "Switching to available model '%s' after backend rejection of '%s'",
+            selected,
+            self._config.model_name,
+        )
+        self._config.model_name = selected
+        return True
+
+    @staticmethod
+    def _should_retry_model_refresh(detail: Optional[str]) -> bool:
+        if not detail:
+            return False
+        text = detail.lower()
+        if "model" not in text:
+            return False
+        cues = ["not found", "load a model", "no model", "missing model", "model is not"]
+        return any(cue in text for cue in cues)
+
+    @staticmethod
+    def _summarise_http_error(response: Optional[Response]) -> Optional[str]:
+        if response is None:
+            return None
+
+        snippets: List[str] = []
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+
+        def _normalise(value: Any) -> None:
+            if isinstance(value, str):
+                cleaned = value.strip()
+                if cleaned:
+                    snippets.append(cleaned)
+            elif isinstance(value, MutableMapping):
+                for candidate in value.values():
+                    _normalise(candidate)
+            elif isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray)):
+                for item in value:
+                    _normalise(item)
+
+        if payload is not None:
+            _normalise(payload)
+
+        if not snippets:
+            text_content = getattr(response, "text", "")
+            if text_content:
+                snippets.append(str(text_content).strip())
+
+        if not snippets:
+            return None
+
+        merged = "; ".join(dict.fromkeys(snippets))
+        if len(merged) > 240:
+            merged = merged[:237] + "…"
+        return merged or None
 
     @staticmethod
     def _coerce_models(payload: Any) -> List[str]:
@@ -850,6 +938,13 @@ class OfflineResponse(Response):
                 f"Offline simulator returned HTTP {self.status_code}", response=self
             )
 
+    @property
+    def text(self) -> str:
+        try:
+            return json.dumps(self._payload)
+        except TypeError:
+            return str(self._payload)
+
 
 class OfflineModelSimulator:
     """In-memory LM Studio surrogate for offline tests."""
@@ -873,6 +968,21 @@ class OfflineModelSimulator:
         messages = payload.get("messages") or []
         if not messages:
             return OfflineResponse(400, {"error": "messages payload is required"})
+        model = str(payload.get("model", "")).strip()
+        with self._lock:
+            available_models = set(self._models)
+        if model and model not in available_models:
+            return OfflineResponse(
+                400,
+                {
+                    "error": {
+                        "message": (
+                            f"Model '{model}' not found. Please load a model or choose one of: "
+                            + ", ".join(sorted(available_models))
+                        )
+                    }
+                },
+            )
         prompt = str(messages[-1].get("content", ""))
         with self._lock:
             self._history.append({"role": "user", "content": prompt})
@@ -897,6 +1007,11 @@ class OfflineModelSimulator:
         with self._lock:
             return list(self._history)
 
+    def set_models(self, models: Iterable[str]) -> None:
+        with self._lock:
+            cleaned = [str(model).strip() for model in models if str(model).strip()]
+            self._models = cleaned or ["offline-simulator"]
+
 
 class OfflineSession:
     """requests.Session compatible stub for offline diagnostics."""
@@ -913,6 +1028,13 @@ class OfflineSession:
 
     def get(self, url: str, timeout: float, verify: bool) -> OfflineResponse:
         return self._simulator.dispatch("GET", url, None)
+
+    def configure_models(self, models: Iterable[str]) -> None:
+        self._simulator.set_models(models)
+
+    @property
+    def simulator(self) -> OfflineModelSimulator:
+        return self._simulator
 
 class ChatOrchestrator:
     """Encapsulates the end-to-end logic for running a chat session."""
@@ -934,6 +1056,7 @@ class ChatOrchestrator:
         self._metrics = metrics
         self._lock = threading.RLock()
         self._load_history()
+        self._synchronise_active_model()
 
     def _load_history(self) -> None:
         try:
@@ -942,6 +1065,29 @@ class ChatOrchestrator:
             LOGGER.error("Failed to load history: %s", exc)
             return
         self._history.load_from(messages)
+
+    def _synchronise_active_model(self) -> None:
+        try:
+            models = self._client.list_models()
+        except APIError as exc:
+            LOGGER.warning("Could not verify active model availability: %s", exc)
+            return
+
+        if not models:
+            LOGGER.warning(
+                "Model listing did not return any entries; retaining configured model '%s'",
+                self._config.model_name,
+            )
+            return
+
+        if self._config.model_name not in models:
+            fallback = models[0]
+            LOGGER.info(
+                "Configured model '%s' not available. Switching to '%s' instead.",
+                self._config.model_name,
+                fallback,
+            )
+            self._config.model_name = fallback
 
     def submit_user_message(self, user_input: str) -> str:
         with self._lock:
@@ -975,7 +1121,17 @@ class ChatOrchestrator:
         except APIError as exc:
             LOGGER.warning("Falling back to configured model due to listing failure: %s", exc)
             return [self._config.model_name]
-        return models or [self._config.model_name]
+        if not models:
+            return [self._config.model_name]
+        if self._config.model_name not in models:
+            fallback = models[0]
+            LOGGER.info(
+                "Configured model '%s' missing from listing. Adopting '%s'.",
+                self._config.model_name,
+                fallback,
+            )
+            self._config.model_name = fallback
+        return models
 
     def select_model(self, model_name: str) -> None:
         with self._lock:

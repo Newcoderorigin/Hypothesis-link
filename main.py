@@ -582,27 +582,26 @@ class PersistentHistoryStore:
 
 
 class PromptEnhancer:
-    """A prompt handler that preserves user intent for the language model."""
-    """A deterministic, lightweight prompt improvement engine."""
+    """Deterministically refine prompts while preserving user intent."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._last_prompt: Optional[str] = None
         self._last_response: Optional[str] = None
+        self._observed_keywords: Dict[str, int] = {}
+        self._max_keywords: int = 32
 
     def enhance(self, prompt: str, context: ConversationHistory) -> str:  # noqa: D401
-        """Return the sanitised prompt without modifying its semantics."""
+        """Return a sanitised, context-aware prompt."""
 
         sanitised = InputSanitiser.sanitise(prompt)
+        contextualised = self._augment_with_context(sanitised, context)
+        enriched = self._add_quality_instructions(contextualised)
         with self._lock:
-            self._last_prompt = sanitised
+            self._last_prompt = enriched
             self._last_response = None
-        return sanitised
-
-    def register_feedback(self, prompt: str, response: str) -> None:
-        with self._lock:
-            self._last_prompt = prompt
-            self._last_response = response
+        self._remember_keywords(sanitised)
+        return enriched
 
     def last_exchange(self) -> Optional[Tuple[str, Optional[str]]]:
         """Expose the most recent prompt/response pair for diagnostics."""
@@ -632,11 +631,16 @@ class PromptEnhancer:
 
     def _remember_keywords(self, text: str) -> None:
         keywords = self._extract_keywords(text)
-        for word in keywords:
-            self._observed_keywords[word] = self._observed_keywords.get(word, 0) + 1
-        if len(self._observed_keywords) > self._max_keywords:
-            least_common = min(self._observed_keywords.items(), key=lambda item: item[1])[0]
-            self._observed_keywords.pop(least_common, None)
+        if not keywords:
+            return
+        with self._lock:
+            for word in keywords:
+                self._observed_keywords[word] = self._observed_keywords.get(word, 0) + 1
+            if len(self._observed_keywords) > self._max_keywords:
+                least_common = min(
+                    self._observed_keywords.items(), key=lambda item: item[1]
+                )[0]
+                self._observed_keywords.pop(least_common, None)
 
     def _add_quality_instructions(self, text: str) -> str:
         word_count = len(text.split())
@@ -645,8 +649,10 @@ class PromptEnhancer:
                 f"{text} Please provide a detailed, structured explanation "
                 "including numbered steps and relevant caveats."
             )
-        if word_count < 20 and self._observed_keywords:
-            emphasised = ", ".join(sorted(self._observed_keywords.keys())[:3])
+        with self._lock:
+            observed_snapshot = dict(self._observed_keywords)
+        if word_count < 20 and observed_snapshot:
+            emphasised = ", ".join(sorted(observed_snapshot.keys())[:3])
             return (
                 f"{text} Ensure the answer references the following key themes: "
                 f"{emphasised}."
@@ -661,9 +667,13 @@ class PromptEnhancer:
         return [word for word in candidates if word not in stopwords]
 
     def register_feedback(self, prompt: str, response: str) -> None:
+        combined_keywords = self._extract_keywords(f"{prompt} {response}")
+        sanitised_prompt = InputSanitiser.sanitise(prompt)
         with self._lock:
-            positive_terms = self._extract_keywords(f"{prompt} {response}")
-            for term in positive_terms:
+            if self._last_prompt is None:
+                self._last_prompt = sanitised_prompt
+            self._last_response = response
+            for term in combined_keywords:
                 self._observed_keywords[term] = self._observed_keywords.get(term, 0) + 2
             if len(self._observed_keywords) > self._max_keywords:
                 sorted_terms = sorted(

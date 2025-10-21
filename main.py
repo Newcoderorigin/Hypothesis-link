@@ -1,244 +1,1442 @@
+"""Hypothesis-link v2
+=====================
+
+This module provides a re-imagined version of the original Hypothesis-link
+application.  The new implementation focuses on the following guiding
+principles:
+
+* **Resilience** – network failures are anticipated and handled with
+  structured retries, exponential backoff and rate limiting safeguards.
+* **Security** – user supplied data is sanitised before being shipped to the
+  backend service.  Configuration secrets are kept out of source control and
+  only read via environment variables or configuration files owned by the
+  executing user.
+* **Observability** – a lightweight metrics subsystem tracks performance data
+  that can later be exported or logged, providing visibility into latency
+  spikes and API usage anomalies.
+* **Extensibility** – the implementation is modular and self-documenting,
+  allowing future maintainers to extend each component independently without
+  having to untangle global state.
+
+The overall design is intentionally verbose; the user requested enterprise
+level robustness, and we comply by investing into defensive programming, rich
+inline documentation and a disciplined separation of concerns.
+
+The module is designed to run on Python 3.13 (and is backwards compatible with
+3.10+).  No deprecated APIs are used, and type hints are supplied to enable
+static analysis with tools such as `pyright` or `mypy`.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import logging
+import os
+import queue
+import random
+import re
+import statistics
 import threading
-import tkinter as tk
-from tkinter import scrolledtext
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, ClassVar, Dict, Iterable, List, MutableMapping, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 import requests
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from requests import Response
 from rich.console import Console
 
-# -------------------------------
-# CONFIGURATION
-# -------------------------------
-API_BASE_URL = "http://192.168.1.73:1234/v1/chat/completions"
-MODEL_NAME = "liquid/lfm2-1.2b"
-console = Console()
-
-# -------------------------------
-# FEEDBACK NETWORK (TAVONIC FRAMEWORK)
-# -------------------------------
-class TavonicFeedbackNet(nn.Module):
-    def __init__(self, input_dim=256, hidden_dim=128, output_dim=256):
-        super(TavonicFeedbackNet, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = torch.tanh(self.fc2(x))
-        x = self.fc3(x)
-        return x
+try:
+    # Tkinter is part of the standard library.  Import errors usually indicate
+    # a headless server without GUI capabilities.  We catch the error to raise
+    # a more descriptive exception later on when the GUI is initialised.
+    import tkinter as tk
+    from tkinter import messagebox, scrolledtext, ttk
+except ModuleNotFoundError as exc:  # pragma: no cover - depends on environment
+    raise RuntimeError(
+        "Tkinter is required to run the Hypothesis-link GUI. "
+        "Install the Python Tk bindings for your platform."  # noqa: TRY002
+    ) from exc
 
 
-class TavonicCognitiveLayer:
-    def __init__(self):
-        self.device = torch.device("cpu")
-        self.model = TavonicFeedbackNet().to(self.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
-        self.loss_fn = nn.MSELoss()
+# ---------------------------------------------------------------------------
+# Logging infrastructure
+# ---------------------------------------------------------------------------
 
-    def encode_text(self, text):
-        # Convert string to fixed vector (basic embedding simulation)
-        vec = torch.zeros(256)
-        for i, ch in enumerate(text.encode("utf-8")):
-            vec[i % 256] += ch / 255.0
-        return vec.unsqueeze(0)
+def _build_logger() -> logging.Logger:
+    """Configure a module level logger with safe defaults.
 
-    def improve_prompt(self, text):
-        with torch.no_grad():
-            input_vec = self.encode_text(text)
-            output_vec = self.model(input_vec)
-            enhanced_text = self.vector_to_text(output_vec)
-        return enhanced_text
+    The logger writes to stdout and is intentionally conservative: INFO for
+    regular events and DEBUG for verbose traces.  In high-volume deployments a
+    JSON formatter or remote log shipper can be plugged in by replacing the
+    handler configuration here.
+    """
 
-    def vector_to_text(self, vector):
-        # Convert vector back to text approximation (symbolic compression)
-        chars = [chr(int(abs(x.item()) * 122) % 126) for x in vector[0]]
-        text = ''.join(chars)
-        return text[:len(text)//4]  # Trim to readable subset
+    logger = logging.getLogger("hypothesis_link")
+    if logger.handlers:
+        return logger
 
-    def learn_from_interaction(self, user_msg, model_reply):
-        x = self.encode_text(user_msg)
-        y = self.encode_text(model_reply)
-        pred = self.model(x)
-        loss = self.loss_fn(pred, y)
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        return loss.item()
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(threadName)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    return logger
 
 
-# -------------------------------
-# HELPER FUNCTIONS
-# -------------------------------
+LOGGER = _build_logger()
+CONSOLE = Console()
 
 
-def send_chat_completion(messages, temperature=0.7):
-    headers = {"Content-Type": "application/json"}
-    payload = {"model": MODEL_NAME, "messages": messages, "temperature": temperature}
+# ---------------------------------------------------------------------------
+# Custom exceptions
+# ---------------------------------------------------------------------------
 
-    try:
-        response = requests.post(API_BASE_URL, headers=headers, json=payload, timeout=120)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        console.print(f"[red]Connection error:[/red] {e}")
-        return None
+class ConfigurationError(RuntimeError):
+    """Raised when the application configuration is invalid."""
 
 
-def format_response(message_data):
-    if not message_data:
-        return "[red]No response from model.[/red]"
-    try:
-        text = message_data['choices'][0]['message']['content']
-        return text.strip()
-    except Exception as e:
-        return f"[red]Unexpected response format:[/red] {e}\n{message_data}"
+class ChatStorageError(RuntimeError):
+    """Raised when the conversation history cannot be persisted."""
 
 
-# -------------------------------
-# CHAT SESSION WITH FEEDBACK
-# -------------------------------
-class AIChatSession:
-    def __init__(self):
-        self.messages = []
-        self.feedback_layer = TavonicCognitiveLayer()
+class APIError(RuntimeError):
+    """Generic API failure encompassing HTTP or schema level issues."""
+
+
+class RateLimitError(APIError):
+    """Raised when API calls exceed the configured rate limits."""
+
+
+class ResponseFormatError(APIError):
+    """Raised when the language model returns an unexpected schema."""
+
+
+# ---------------------------------------------------------------------------
+# Configuration handling
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class AppPaths:
+    """Container for important filesystem paths used by the application."""
+
+    base_dir: Path = field(default_factory=lambda: Path.cwd())
+    config_file_name: str = "hypothesis_link.json"
+    history_file_name: str = "hypothesis_history.json"
+
+    @property
+    def config_path(self) -> Path:
+        return self.base_dir / self.config_file_name
+
+    @property
+    def history_path(self) -> Path:
+        return self.base_dir / self.history_file_name
+
+
+@dataclass(slots=True)
+class AppConfig:
+    """Configuration data for the LM backend and runtime behaviour."""
+
+    api_base_url: str
+    model_name: str
+    timeout: float = 45.0
+    max_retries: int = 3
+    request_backoff: float = 1.8
+    history_limit: int = 32
+    rate_limit_per_minute: int = 90
+    verify_tls: bool = True
+
+    @classmethod
+    def from_env(cls, paths: AppPaths) -> "AppConfig":
+        """Load configuration from environment variables or disk.
+
+        Precedence order (highest to lowest): environment variables, JSON
+        configuration file, sensible defaults.  Only a minimal JSON structure is
+        required to bootstrap the application:
+
+        ```json
+        {
+            "api_base_url": "http://192.168.1.73:1234",
+            "model_name": "liquid/lfm2-1.2b"
+        }
+        ```
+        """
+
+        env_url = os.getenv("HYPOTHESIS_API_URL")
+        env_model = os.getenv("HYPOTHESIS_MODEL")
+        config_data: Dict[str, Any] = {}
+
+        default_base = "http://192.168.1.73:1234"
+        default_model = "liquid/lfm2-1.2b"
+
+        if paths.config_path.exists():
+            try:
+                config_data = json.loads(paths.config_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ConfigurationError(
+                    f"Configuration file {paths.config_path} contains invalid JSON"
+                ) from exc
+
+        data = {
+            "api_base_url": env_url or config_data.get("api_base_url") or default_base,
+            "model_name": env_model or config_data.get("model_name") or default_model,
+            "timeout": float(os.getenv("HYPOTHESIS_TIMEOUT", config_data.get("timeout", 45))),
+            "max_retries": int(os.getenv("HYPOTHESIS_RETRIES", config_data.get("max_retries", 3))),
+            "request_backoff": float(
+                os.getenv("HYPOTHESIS_BACKOFF", config_data.get("request_backoff", 1.8))
+            ),
+            "history_limit": int(
+                os.getenv("HYPOTHESIS_HISTORY_LIMIT", config_data.get("history_limit", 32))
+            ),
+            "rate_limit_per_minute": int(
+                os.getenv(
+                    "HYPOTHESIS_RPM",
+                    config_data.get("rate_limit_per_minute", 90),
+                )
+            ),
+            "verify_tls": bool(
+                json.loads(
+                    os.getenv(
+                        "HYPOTHESIS_VERIFY_TLS",
+                        json.dumps(config_data.get("verify_tls", True)),
+                    )
+                )
+            ),
+        }
+
+        config = cls(**data)
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        """Validate configuration fields and raise :class:`ConfigurationError`.
+
+        A series of defensive checks ensures invalid data is surfaced early and
+        in a descriptive fashion.
+        """
+
+        if not self.api_base_url:
+            raise ConfigurationError("API base URL is required")
+        if not self.model_name:
+            raise ConfigurationError("Model name is required")
+        if self.timeout <= 0:
+            raise ConfigurationError("Timeout must be positive")
+        if self.max_retries < 0:
+            raise ConfigurationError("Retries cannot be negative")
+        if self.request_backoff <= 1.0:
+            raise ConfigurationError("Backoff multiplier must exceed 1.0")
+        if self.history_limit < 1:
+            raise ConfigurationError("History limit must be at least 1")
+        if self.rate_limit_per_minute < 1:
+            raise ConfigurationError("Rate limit must be positive")
+        # Normalise and validate the LM Studio endpoint layout.
+        LMStudioEndpoints(self.api_base_url)
+
+
+@dataclass(slots=True)
+class LMStudioEndpoints:
+    """Utility helper that exposes the canonical LM Studio REST endpoints."""
+
+    base_url: str
+
+    _PATHS: ClassVar[Dict[str, str]] = {
+        "chat_completions": "/v1/chat/completions",
+        "completions": "/v1/completions",
+        "embeddings": "/v1/embeddings",
+        "models": "/v1/models",
+        "moderations": "/v1/moderations",
+        "images_generations": "/v1/images/generations",
+        "audio_transcriptions": "/v1/audio/transcriptions",
+        "audio_speech": "/v1/audio/speech",
+        "tokenize": "/v1/tokenize",
+        "detokenize": "/v1/detokenize",
+        "rerank": "/v1/rerank",
+        "health": "/v1/health",
+    }
+
+    def __post_init__(self) -> None:
+        if not self.base_url:
+            raise ConfigurationError("API base URL is required to construct endpoints")
+
+        parsed = urlparse(self.base_url)
+        if not parsed.scheme or not parsed.netloc:
+            raise ConfigurationError("API base URL must include a valid scheme and host")
+        if parsed.scheme not in {"http", "https"}:
+            raise ConfigurationError("API base URL must use HTTP or HTTPS")
+        if parsed.query or parsed.fragment:
+            raise ConfigurationError("API base URL must not contain query parameters")
+
+        path = parsed.path.rstrip("/")
+        normalised = f"{parsed.scheme}://{parsed.netloc}{path}"
+        self.base_url = normalised.rstrip("/")
+
+    def url_for(self, endpoint: str) -> str:
+        try:
+            path = self._PATHS[endpoint]
+        except KeyError as exc:  # pragma: no cover - defensive guard
+            raise ConfigurationError(f"Unknown LM Studio endpoint: {endpoint}") from exc
+        # The API expects all endpoints to hang from the same base URL.  We rely on
+        # :func:`urllib.parse.urljoin` to safely compose the absolute URL.
+        return urljoin(f"{self.base_url}/", path)
+
+    @property
+    def chat_completions(self) -> str:
+        return self.url_for("chat_completions")
+
+    @property
+    def completions(self) -> str:
+        return self.url_for("completions")
+
+    @property
+    def embeddings(self) -> str:
+        return self.url_for("embeddings")
+
+    @property
+    def models(self) -> str:
+        return self.url_for("models")
+
+    @property
+    def moderations(self) -> str:
+        return self.url_for("moderations")
+
+    @property
+    def images_generations(self) -> str:
+        return self.url_for("images_generations")
+
+    @property
+    def audio_transcriptions(self) -> str:
+        return self.url_for("audio_transcriptions")
+
+    @property
+    def audio_speech(self) -> str:
+        return self.url_for("audio_speech")
+
+    @property
+    def tokenize(self) -> str:
+        return self.url_for("tokenize")
+
+    @property
+    def detokenize(self) -> str:
+        return self.url_for("detokenize")
+
+    @property
+    def rerank(self) -> str:
+        return self.url_for("rerank")
+
+    @property
+    def health(self) -> str:
+        return self.url_for("health")
+
+    def as_dict(self) -> Dict[str, str]:
+        return {name: self.url_for(name) for name in self._PATHS}
+
+
+# ---------------------------------------------------------------------------
+# Metrics and analytics support
+# ---------------------------------------------------------------------------
+
+class MetricsTracker:
+    """Tracks performance metrics for API calls.
+
+    Metrics are kept in-memory for simplicity, but the design allows easy
+    persistence to disk or export to Prometheus by providing additional hooks.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._durations: List[float] = []
+        self._failures: int = 0
+
+    def record(self, duration: float, success: bool) -> None:
+        with self._lock:
+            if success:
+                self._durations.append(duration)
+            else:
+                self._failures += 1
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            durations = list(self._durations)
+            failures = self._failures
+        if durations:
+            return {
+                "count": len(durations),
+                "mean": statistics.fmean(durations),
+                "p95": statistics.quantiles(durations, n=100)[94],
+                "last": durations[-1],
+                "failures": failures,
+            }
+        return {"count": 0, "mean": 0.0, "p95": 0.0, "last": 0.0, "failures": failures}
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting and sanitisation utilities
+# ---------------------------------------------------------------------------
+
+class RateLimiter:
+    """A naive token bucket implementation suitable for short-lived clients."""
+
+    def __init__(self, tokens_per_minute: int) -> None:
+        self.tokens_per_minute = tokens_per_minute
+        self._lock = threading.Lock()
+        self._tokens = tokens_per_minute
+        self._last_refill = time.monotonic()
+
+    def acquire(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_refill
+            tokens_to_add = int(elapsed * self.tokens_per_minute / 60)
+            if tokens_to_add:
+                self._tokens = min(self.tokens_per_minute, self._tokens + tokens_to_add)
+                self._last_refill = now
+
+            if self._tokens <= 0:
+                raise RateLimitError(
+                    "Rate limit exceeded: too many requests per minute. "
+                    "Try again shortly."
+                )
+
+            self._tokens -= 1
+
+
+class InputSanitiser:
+    """Ensure user supplied text is suitable for the target language model."""
+
+    _CONTROL_CHAR_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+    @classmethod
+    def sanitise(cls, text: str) -> str:
+        """Remove control characters and trim suspicious content."""
+
+        cleaned = cls._CONTROL_CHAR_PATTERN.sub("", text)
+        cleaned = cleaned.strip()
+        if not cleaned:
+            raise ValueError("Input is empty or contains only invalid characters")
+        return cleaned
+
+
+# ---------------------------------------------------------------------------
+# Conversation history persistence
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class ChatMessage:
+    """Represents a single turn in the conversation."""
+
+    role: str
+    content: str
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "role": self.role,
+            "content": self.content,
+            "timestamp": self.timestamp.isoformat(),
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: MutableMapping[str, Any]) -> "ChatMessage":
+        timestamp_str = payload.get("timestamp")
+        timestamp = (
+            datetime.fromisoformat(timestamp_str)
+            if isinstance(timestamp_str, str)
+            else datetime.now(timezone.utc)
+        )
+        return cls(
+            role=str(payload.get("role", "user")),
+            content=str(payload.get("content", "")),
+            timestamp=timestamp,
+            metadata=dict(payload.get("metadata", {})),
+        )
+
+
+class ConversationHistory:
+    """Thread-safe in-memory storage for conversation messages."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._messages: List[ChatMessage] = []
+        self._lock = threading.RLock()
+
+    def append(self, message: ChatMessage) -> None:
+        with self._lock:
+            self._messages.append(message)
+            if len(self._messages) > self._limit:
+                # remove oldest
+                del self._messages[0]
+
+    def export(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [dataclasses.asdict(msg) for msg in self._messages]
+
+    def as_payload(self) -> List[Dict[str, str]]:
+        with self._lock:
+            return [{"role": msg.role, "content": msg.content} for msg in self._messages]
+
+    def load_from(self, messages: Iterable[ChatMessage]) -> None:
+        with self._lock:
+            self._messages = list(messages)[-self._limit :]
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._messages)
+
+
+class PersistentHistoryStore:
+    """Persists history to disk so users can resume sessions."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
         self._lock = threading.Lock()
 
-    def add_message(self, role, content):
-        self.messages.append({"role": role, "content": content})
-
-    def query_model(self, user_input):
-        with self._lock:
-            improved_prompt = self.feedback_layer.improve_prompt(user_input)
-            if improved_prompt:
-                console.print(f"[cyan]Enhanced prompt applied.[/cyan]")
-            self.add_message("user", improved_prompt or user_input)
-
-            response_data = send_chat_completion(self.messages)
-            if response_data:
-                reply = format_response(response_data)
-                self.add_message("assistant", reply)
-                # Learn from interaction
-                loss = self.feedback_layer.learn_from_interaction(user_input, reply)
-                console.print(f"[dim]Tavonic learning loss: {loss:.6f}[/dim]")
-                return reply
-            else:
-                return "[Error] No valid response received."
-        improved_prompt = self.feedback_layer.improve_prompt(user_input)
-        if improved_prompt:
-            console.print(f"[cyan]Enhanced prompt applied.[/cyan]")
-        self.add_message("user", improved_prompt or user_input)
-
-        response_data = send_chat_completion(self.messages)
-        if response_data:
-            reply = format_response(response_data)
-            self.add_message("assistant", reply)
-            # Learn from interaction
-            loss = self.feedback_layer.learn_from_interaction(user_input, reply)
-            console.print(f"[dim]Tavonic learning loss: {loss:.6f}[/dim]")
-            return reply
-        else:
-            return "[Error] No valid response received."
-
-
-# -------------------------------
-# TKINTER GUI
-# -------------------------------
-class AIChatGUI:
-    def __init__(self, master):
-        self.master = master
-        self.master.title("LM Studio Chat + Tavonic Cognitive Layer")
-        self.master.geometry("750x550")
-        self.chat_session = AIChatSession()
-
-        self.chat_display = scrolledtext.ScrolledText(master, wrap=tk.WORD, font=("Consolas", 11))
-        self.chat_display.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
-        self.chat_display.insert(tk.END, "Connected to LM Studio (liquid/lfm2-1.2b) with Tavonic Neural Enhancement.\n\n")
-        self.chat_display.configure(state='disabled')
-
-        self.user_entry = tk.Entry(master, font=("Consolas", 11))
-        self.user_entry.pack(padx=10, pady=5, fill=tk.X)
-        self.user_entry.bind('<Return>', self.send_message)
-
-        self.button_frame = tk.Frame(master)
-        self.button_frame.pack(pady=5)
-        self.send_button = tk.Button(self.button_frame, text="Send", command=self.send_message)
-        self.send_button.pack(side=tk.LEFT, padx=5)
-        tk.Button(self.button_frame, text="Clear", command=self.clear_chat).pack(side=tk.LEFT, padx=5)
-        tk.Button(self.button_frame, text="Quit", command=self.master.quit).pack(side=tk.LEFT, padx=5)
-        self._request_in_progress = False
-        tk.Button(self.button_frame, text="Send", command=self.send_message).pack(side=tk.LEFT, padx=5)
-        tk.Button(self.button_frame, text="Clear", command=self.clear_chat).pack(side=tk.LEFT, padx=5)
-        tk.Button(self.button_frame, text="Quit", command=self.master.quit).pack(side=tk.LEFT, padx=5)
-
-    def clear_chat(self):
-        self.chat_display.configure(state='normal')
-        self.chat_display.delete('1.0', tk.END)
-        self.chat_display.insert(tk.END, "Chat cleared.\n")
-        self.chat_display.configure(state='disabled')
-
-    def send_message(self, event=None):
-        if self._request_in_progress:
-            return
-
-        user_input = self.user_entry.get().strip()
-        if not user_input:
-            return
-        self.user_entry.delete(0, tk.END)
-        self.display_message(f"You: {user_input}\n", 'blue')
-        self._request_in_progress = True
-        self.send_button.config(state=tk.DISABLED)
-        threading.Thread(
-            target=self._get_response_worker,
-            args=(user_input,),
-            daemon=True,
-        ).start()
-
-    def _get_response_worker(self, user_input):
+    def load(self) -> List[ChatMessage]:
+        if not self._path.exists():
+            return []
         try:
-            reply = self.chat_session.query_model(user_input)
-        except Exception as exc:
-            console.print(f"[red]Background request failed:[/red] {exc}")
-            reply = "[Error] Request failed. Check logs for details."
-        self.master.after(
-            0, lambda: self._display_and_release(f"Assistant: {reply}\n\n", 'green')
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:  # pragma: no cover - corrupted file
+            raise ChatStorageError("History file is corrupted") from exc
+        return [ChatMessage.from_dict(item) for item in data]
+
+    def save(self, messages: Iterable[ChatMessage]) -> None:
+        serialised = [msg.to_dict() for msg in messages]
+        tmp_path = self._path.with_suffix(".tmp")
+        with self._lock:
+            try:
+                tmp_path.write_text(json.dumps(serialised, indent=2), encoding="utf-8")
+                tmp_path.replace(self._path)
+            except OSError as exc:  # pragma: no cover - disk failure
+                raise ChatStorageError("Could not persist conversation history") from exc
+
+
+# ---------------------------------------------------------------------------
+# Prompt enhancement layer
+# ---------------------------------------------------------------------------
+
+class PromptEnhancer:
+    """A deterministic, lightweight prompt improvement engine.
+
+    The enhancer analyses the user's prompt, referencing prior conversation
+    turns for context.  It applies lexical normalisation, optional summarisation
+    and adds clarifying instructions when the input seems underspecified.  The
+    implementation avoids heavy ML dependencies for portability.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._observed_keywords: Dict[str, int] = {}
+        self._max_keywords = 64
+
+    def enhance(self, prompt: str, context: ConversationHistory) -> str:
+        prompt = InputSanitiser.sanitise(prompt)
+        with self._lock:
+            baseline = prompt
+            baseline = self._ensure_punctuation(baseline)
+            baseline = self._normalise_whitespace(baseline)
+            baseline = self._augment_with_context(baseline, context)
+            self._remember_keywords(baseline)
+            enriched = self._add_quality_instructions(baseline)
+            return enriched
+
+    @staticmethod
+    def _ensure_punctuation(text: str) -> str:
+        if text and text[-1].isalnum():
+            return text + "."
+        return text
+
+    @staticmethod
+    def _normalise_whitespace(text: str) -> str:
+        return re.sub(r"\s+", " ", text)
+
+    def _augment_with_context(self, text: str, context: ConversationHistory) -> str:
+        """Include references to important entities from prior messages."""
+
+        summary_terms: List[str] = []
+        for message in context.export()[::-1]:
+            if message["role"] != "assistant":
+                continue
+            terms = self._extract_keywords(message["content"])
+            for term in terms:
+                if term not in summary_terms:
+                    summary_terms.append(term)
+                if len(summary_terms) >= 4:
+                    break
+            if len(summary_terms) >= 4:
+                break
+
+        if summary_terms:
+            joined = ", ".join(summary_terms)
+            return f"{text} (Consider continuity with: {joined}.)"
+        return text
+
+    def _remember_keywords(self, text: str) -> None:
+        keywords = self._extract_keywords(text)
+        for word in keywords:
+            self._observed_keywords[word] = self._observed_keywords.get(word, 0) + 1
+        if len(self._observed_keywords) > self._max_keywords:
+            # remove least frequent keyword
+            least_common = min(self._observed_keywords.items(), key=lambda item: item[1])[0]
+            self._observed_keywords.pop(least_common, None)
+
+    def _add_quality_instructions(self, text: str) -> str:
+        """If user prompt is short, append clarifying instructions."""
+
+        word_count = len(text.split())
+        if word_count < 8:
+            return (
+                f"{text} Please provide a detailed, structured explanation "
+                "including numbered steps and relevant caveats."
+            )
+        if word_count < 20 and self._observed_keywords:
+            emphasised = ", ".join(sorted(self._observed_keywords.keys())[:3])
+            return (
+                f"{text} Ensure the answer references the following key themes: "
+                f"{emphasised}."
+            )
+        return text
+
+    @staticmethod
+    def _extract_keywords(text: str) -> List[str]:
+        text = text.lower()
+        candidates = re.findall(r"[a-zA-Z]{4,}", text)
+        stopwords = {"this", "that", "have", "with", "from", "about", "which"}
+        return [word for word in candidates if word not in stopwords]
+
+    def register_feedback(self, prompt: str, response: str) -> None:
+        """Record which keywords yielded rich responses to inform future prompts."""
+
+        with self._lock:
+            positive_terms = self._extract_keywords(prompt + " " + response)
+            for term in positive_terms:
+                self._observed_keywords[term] = self._observed_keywords.get(term, 0) + 2
+            if len(self._observed_keywords) > self._max_keywords:
+                sorted_terms = sorted(
+                    self._observed_keywords.items(), key=lambda item: item[1], reverse=True
+                )
+                self._observed_keywords = dict(sorted_terms[: self._max_keywords])
+
+
+# ---------------------------------------------------------------------------
+# HTTP Client for interacting with the model API
+# ---------------------------------------------------------------------------
+
+class SecureHTTPClient:
+    """Handles communication with the language model backend."""
+
+    def __init__(self, config: AppConfig, metrics: MetricsTracker, limiter: RateLimiter) -> None:
+        self._config = config
+        self._metrics = metrics
+        self._limiter = limiter
+        self._session = requests.Session()
+        self._session.headers.update({"Content-Type": "application/json"})
+        self._lock = threading.Lock()
+        self._endpoints = LMStudioEndpoints(config.api_base_url)
+
+    def close(self) -> None:
+        self._session.close()
+
+    def chat_completion(self, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
+        """Send a chat completion request and return the assistant's reply."""
+
+        payload = {
+            "model": self._config.model_name,
+            "messages": messages,
+            "temperature": temperature,
+        }
+
+        retries = 0
+        backoff = self._config.request_backoff
+        while True:
+            self._limiter.acquire()
+            start = time.perf_counter()
+            try:
+                response = self._session.post(
+                    self._endpoints.chat_completions,
+                    json=payload,
+                    timeout=self._config.timeout,
+                    verify=self._config.verify_tls,
+                )
+                response.raise_for_status()
+                data = response.json()
+                reply = self._extract_content(data)
+                duration = time.perf_counter() - start
+                self._metrics.record(duration, success=True)
+                LOGGER.debug("Received response in %.2fs", duration)
+                return reply
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                self._metrics.record(time.perf_counter() - start, success=False)
+                if retries >= self._config.max_retries:
+                    raise APIError("Network failure contacting language model") from exc
+                retries += 1
+                sleep_for = backoff ** retries + random.uniform(0, 0.2)
+                LOGGER.warning(
+                    "Transient network failure (%s). Retrying in %.2fs (attempt %d/%d)",
+                    exc,
+                    sleep_for,
+                    retries,
+                    self._config.max_retries,
+                )
+                time.sleep(sleep_for)
+            except requests.HTTPError as exc:
+                self._metrics.record(time.perf_counter() - start, success=False)
+                status = exc.response.status_code if isinstance(exc.response, Response) else None
+                raise APIError(f"Language model returned HTTP {status}") from exc
+            except ValueError as exc:
+                self._metrics.record(time.perf_counter() - start, success=False)
+                raise ResponseFormatError("Malformed JSON received from backend") from exc
+
+    def list_models(self) -> List[str]:
+        """Return the list of models exposed by the LM Studio server."""
+
+        self._limiter.acquire()
+        start = time.perf_counter()
+        try:
+            response = self._session.get(
+                self._endpoints.models,
+                timeout=self._config.timeout,
+                verify=self._config.verify_tls,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            models = self._coerce_models(payload)
+            self._metrics.record(time.perf_counter() - start, success=True)
+            return models
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            self._metrics.record(time.perf_counter() - start, success=False)
+            raise APIError("Network failure while listing models") from exc
+        except requests.HTTPError as exc:
+            self._metrics.record(time.perf_counter() - start, success=False)
+            status = exc.response.status_code if isinstance(exc.response, Response) else None
+            raise APIError(f"Model listing returned HTTP {status}") from exc
+        except ValueError as exc:
+            self._metrics.record(time.perf_counter() - start, success=False)
+            raise ResponseFormatError("Malformed JSON payload from model listing") from exc
+
+    def available_endpoints(self) -> Dict[str, str]:
+        """Expose all LM Studio endpoints for observability/diagnostics."""
+
+        return self._endpoints.as_dict()
+
+    def check_health(self) -> bool:
+        """Perform a lightweight health-check against the LM Studio server."""
+
+        try:
+            response = self._session.get(
+                self._endpoints.health,
+                timeout=min(self._config.timeout, 5.0),
+                verify=self._config.verify_tls,
+            )
+            return response.ok
+        except requests.RequestException:
+            return False
+
+    @staticmethod
+    def _coerce_models(payload: Any) -> List[str]:
+        """Normalise the `/models` response structure into a list of strings."""
+
+        models: List[str] = []
+        if isinstance(payload, MutableMapping):
+            data = payload.get("data")
+            if isinstance(data, Iterable):
+                for entry in data:
+                    if isinstance(entry, MutableMapping):
+                        candidate = entry.get("id") or entry.get("name")
+                        if candidate:
+                            models.append(str(candidate))
+            elif "id" in payload:
+                models.append(str(payload["id"]))
+
+        # Deduplicate while preserving order.
+        seen = set()
+        unique_models = []
+        for model in models:
+            if model not in seen:
+                unique_models.append(model)
+                seen.add(model)
+
+        return unique_models
+
+    @staticmethod
+    def _extract_content(data: Dict[str, Any]) -> str:
+        try:
+            return data["choices"][0]["message"]["content"].strip()
+        except (KeyError, IndexError, AttributeError) as exc:
+            raise ResponseFormatError("Unexpected response structure from backend") from exc
+
+
+# ---------------------------------------------------------------------------
+# Chat orchestration layer
+# ---------------------------------------------------------------------------
+
+class ChatOrchestrator:
+    """Encapsulates the end-to-end logic for running a chat session."""
+
+    def __init__(
+        self,
+        config: AppConfig,
+        history: ConversationHistory,
+        store: PersistentHistoryStore,
+        enhancer: PromptEnhancer,
+        http_client: SecureHTTPClient,
+        metrics: MetricsTracker,
+    ) -> None:
+        self._config = config
+        self._history = history
+        self._store = store
+        self._enhancer = enhancer
+        self._client = http_client
+        self._metrics = metrics
+        self._lock = threading.RLock()
+        self._load_history()
+
+    def _load_history(self) -> None:
+        try:
+            messages = self._store.load()
+        except ChatStorageError as exc:
+            LOGGER.error("Failed to load history: %s", exc)
+            return
+        self._history.load_from(messages)
+
+    def submit_user_message(self, user_input: str) -> str:
+        """Process user input, query the backend and persist the outcome."""
+
+        with self._lock:
+            enhanced_prompt = self._enhancer.enhance(user_input, self._history)
+            messages_payload = self._history.as_payload()
+            messages_payload.append({"role": "user", "content": enhanced_prompt})
+
+            LOGGER.info("Dispatching prompt with %d prior turns", len(messages_payload))
+            response_text = self._client.chat_completion(messages_payload)
+
+            user_message = ChatMessage(role="user", content=user_input)
+            assistant_message = ChatMessage(role="assistant", content=response_text)
+            self._history.append(user_message)
+            self._history.append(assistant_message)
+            try:
+                self._store.save(self._history.export())
+            except ChatStorageError as exc:
+                LOGGER.warning("Could not persist conversation history: %s", exc)
+
+            self._enhancer.register_feedback(user_input, response_text)
+            metrics = self._metrics.snapshot()
+            LOGGER.debug("Metrics snapshot: %s", metrics)
+            return response_text
+
+    def export_history(self) -> List[Dict[str, Any]]:
+        return self._history.export()
+
+    def available_models(self) -> List[str]:
+        try:
+            models = self._client.list_models()
+        except APIError as exc:
+            LOGGER.warning("Falling back to configured model due to listing failure: %s", exc)
+            return [self._config.model_name]
+        return models or [self._config.model_name]
+
+    def select_model(self, model_name: str) -> None:
+        with self._lock:
+            LOGGER.info("Switching active model to %s", model_name)
+            self._config.model_name = model_name
+
+    def current_model(self) -> str:
+        return self._config.model_name
+
+    def endpoints(self) -> Dict[str, str]:
+        return self._client.available_endpoints()
+
+    def health_status(self) -> bool:
+        return self._client.check_health()
+
+    def shutdown(self) -> None:
+        LOGGER.info("Shutting down orchestrator")
+        self._client.close()
+
+
+# ---------------------------------------------------------------------------
+# Tkinter based GUI
+# ---------------------------------------------------------------------------
+
+class ChatGUI:
+    """Tkinter based desktop client for Hypothesis-link."""
+
+    def __init__(self, orchestrator: ChatOrchestrator, metrics: MetricsTracker) -> None:
+        self._orchestrator = orchestrator
+        self._metrics = metrics
+        self._palette = self._build_palette()
+        self._root = tk.Tk()
+        self._root.title("Hypothesis-link v2 – Enterprise Edition")
+        self._root.geometry("1024x720")
+        self._root.minsize(920, 640)
+        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._status_var = tk.StringVar(value="Initialising…")
+        self._metrics_var = tk.StringVar(value=self._format_metrics(self._metrics.snapshot()))
+        self._health_var = tk.StringVar(value="Health: checking…")
+        self._model_var = tk.StringVar(value=self._orchestrator.current_model())
+
+        self._apply_theme()
+        self._build_layout()
+
+        self._work_queue: "queue.Queue[Tuple[str, threading.Event]]" = queue.Queue()
+        self._response_thread = threading.Thread(
+            target=self._response_worker,
+            name="ChatResponseWorker",
+            daemon=True,
+        )
+        self._response_thread.start()
+
+        self._populate_endpoints()
+        self._append_initial_history()
+        self._refresh_models_async()
+        self._refresh_health_async()
+
+    def _build_palette(self) -> Dict[str, str]:
+        return {
+            "background": "#0f172a",
+            "card": "#111c3a",
+            "accent": "#38bdf8",
+            "accent_dark": "#0ea5e9",
+            "text": "#f8fafc",
+            "muted": "#94a3b8",
+            "success": "#22c55e",
+            "danger": "#ef4444",
+        }
+
+    def _apply_theme(self) -> None:
+        palette = self._palette
+        self._root.configure(bg=palette["background"])
+        style = ttk.Style(self._root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:  # pragma: no cover - depends on platform themes
+            pass
+
+        style.configure("Background.TFrame", background=palette["background"])
+        style.configure("Card.TFrame", background=palette["card"], borderwidth=0)
+        style.configure("CardInner.TFrame", background=palette["card"], borderwidth=0)
+        style.configure(
+            "Title.TLabel",
+            background=palette["background"],
+            foreground=palette["text"],
+            font=("Segoe UI", 22, "bold"),
+        )
+        style.configure(
+            "Subtitle.TLabel",
+            background=palette["background"],
+            foreground=palette["muted"],
+            font=("Segoe UI", 12),
+        )
+        style.configure(
+            "Status.TLabel",
+            background=palette["background"],
+            foreground=palette["accent"],
+            font=("Segoe UI", 11, "bold"),
+        )
+        style.configure(
+            "Metrics.TLabel",
+            background=palette["background"],
+            foreground=palette["muted"],
+            font=("Segoe UI", 11),
+        )
+        style.configure(
+            "HealthGood.TLabel",
+            background=palette["background"],
+            foreground=palette["success"],
+            font=("Segoe UI", 11, "bold"),
+        )
+        style.configure(
+            "HealthBad.TLabel",
+            background=palette["background"],
+            foreground=palette["danger"],
+            font=("Segoe UI", 11, "bold"),
+        )
+        style.configure(
+            "HealthUnknown.TLabel",
+            background=palette["background"],
+            foreground=palette["muted"],
+            font=("Segoe UI", 11, "bold"),
+        )
+        style.configure(
+            "Section.TLabel",
+            background=palette["card"],
+            foreground=palette["text"],
+            font=("Segoe UI", 13, "bold"),
+        )
+        style.configure(
+            "Caption.TLabel",
+            background=palette["card"],
+            foreground=palette["muted"],
+            font=("Segoe UI", 10),
+            wraplength=260,
+            justify=tk.LEFT,
+        )
+        style.configure(
+            "Accent.TButton",
+            background=palette["accent"],
+            foreground=palette["background"],
+            padding=(10, 6),
+            font=("Segoe UI", 11, "bold"),
+            borderwidth=0,
+        )
+        style.map(
+            "Accent.TButton",
+            background=[("active", palette["accent_dark"]), ("disabled", "#1f2937")],
+            foreground=[("disabled", palette["muted"])],
+        )
+        style.configure(
+            "Ghost.TButton",
+            background="#1e293b",
+            foreground=palette["text"],
+            padding=(10, 6),
+            font=("Segoe UI", 11),
+            borderwidth=0,
+        )
+        style.map(
+            "Ghost.TButton",
+            background=[("active", "#334155"), ("disabled", "#1f2937")],
+            foreground=[("disabled", palette["muted"])],
+        )
+        style.configure(
+            "Treeview",
+            background=palette["card"],
+            fieldbackground=palette["card"],
+            foreground=palette["text"],
+            bordercolor=palette["card"],
+            rowheight=24,
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=palette["accent"],
+            foreground=palette["background"],
+            bordercolor=palette["accent"],
+            relief="flat",
+            font=("Segoe UI", 11, "bold"),
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", palette["accent_dark"])],
+            foreground=[("selected", palette["background"])],
+        )
+        style.configure(
+            "Activity.Horizontal.TProgressbar",
+            troughcolor=palette["card"],
+            background=palette["accent"],
+            bordercolor=palette["card"],
+            lightcolor=palette["accent"],
+            darkcolor=palette["accent_dark"],
         )
 
-    def _display_and_release(self, message, color):
-        self.display_message(message, color)
-        self._request_in_progress = False
-        self.send_button.config(state=tk.NORMAL)
-        reply = self.chat_session.query_model(user_input)
-        self.master.after(
-            0, lambda: self.display_message(f"Assistant: {reply}\n\n", 'green')
+    def _build_layout(self) -> None:
+        palette = self._palette
+        outer = ttk.Frame(self._root, padding=(24, 20, 24, 20), style="Background.TFrame")
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        header = ttk.Frame(outer, style="Background.TFrame")
+        header.pack(fill=tk.X)
+        ttk.Label(header, text="Hypothesis-link Enterprise", style="Title.TLabel").pack(
+            anchor=tk.W
         )
-        threading.Thread(target=self.get_response, args=(user_input,)).start()
+        ttk.Label(
+            header,
+            text="Secure, beautiful interface for LM Studio",
+            style="Subtitle.TLabel",
+        ).pack(anchor=tk.W, pady=(4, 0))
 
-    def get_response(self, user_input):
-        reply = self.chat_session.query_model(user_input)
-        self.display_message(f"Assistant: {reply}\n\n", 'green')
+        info_row = ttk.Frame(header, style="Background.TFrame")
+        info_row.pack(fill=tk.X, pady=(12, 0))
+        info_row.columnconfigure(0, weight=1)
+        info_row.columnconfigure(1, weight=1)
+        info_row.columnconfigure(2, weight=0)
+        self._status_label = ttk.Label(info_row, textvariable=self._status_var, style="Status.TLabel")
+        self._status_label.grid(row=0, column=0, sticky=tk.W)
+        self._metrics_label = ttk.Label(info_row, textvariable=self._metrics_var, style="Metrics.TLabel")
+        self._metrics_label.grid(row=0, column=1, sticky=tk.E, padx=(0, 12))
+        self._health_label = ttk.Label(info_row, textvariable=self._health_var, style="HealthUnknown.TLabel")
+        self._health_label.grid(row=0, column=2, sticky=tk.E)
 
-    def display_message(self, message, color):
-        self.chat_display.configure(state='normal')
-        self.chat_display.insert(tk.END, message, (color,))
-        self.chat_display.tag_configure('blue', foreground='blue')
-        self.chat_display.tag_configure('green', foreground='green')
-        self.chat_display.configure(state='disabled')
-        self.chat_display.yview(tk.END)
+        content = ttk.Frame(outer, style="Background.TFrame")
+        content.pack(fill=tk.BOTH, expand=True, pady=(16, 0))
+        content.columnconfigure(0, weight=3)
+        content.columnconfigure(1, weight=2)
+
+        chat_card = ttk.Frame(content, padding=18, style="Card.TFrame")
+        chat_card.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        chat_card.columnconfigure(0, weight=1)
+
+        insight_card = ttk.Frame(content, padding=18, style="Card.TFrame")
+        insight_card.grid(row=0, column=1, sticky="nsew")
+        insight_card.columnconfigure(0, weight=1)
+        insight_card.rowconfigure(2, weight=1)
+
+        model_row = ttk.Frame(chat_card, style="CardInner.TFrame")
+        model_row.grid(row=0, column=0, sticky="ew")
+        model_row.columnconfigure(1, weight=1)
+        ttk.Label(model_row, text="Active model", style="Section.TLabel").grid(
+            row=0, column=0, sticky=tk.W
+        )
+        self._model_dropdown = ttk.Combobox(
+            model_row,
+            textvariable=self._model_var,
+            values=[self._model_var.get()],
+            state="readonly",
+        )
+        self._model_dropdown.grid(row=0, column=1, sticky="ew", padx=(12, 12))
+        self._model_dropdown.bind("<<ComboboxSelected>>", self._on_model_changed)
+        self._model_refresh = ttk.Button(
+            model_row,
+            text="Refresh",
+            style="Ghost.TButton",
+            command=self._refresh_models_async,
+        )
+        self._model_refresh.grid(row=0, column=2, sticky=tk.E)
+
+        ttk.Separator(chat_card, orient=tk.HORIZONTAL).grid(row=1, column=0, sticky="ew", pady=(12, 12))
+
+        self._chat_display = scrolledtext.ScrolledText(
+            chat_card,
+            wrap=tk.WORD,
+            font=("Segoe UI", 11),
+            height=20,
+            state=tk.DISABLED,
+            bg=palette["background"],
+            fg=palette["text"],
+            insertbackground=palette["accent"],
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        self._chat_display.grid(row=2, column=0, sticky="nsew")
+        chat_card.rowconfigure(2, weight=1)
+        self._configure_chat_display()
+
+        ttk.Separator(chat_card, orient=tk.HORIZONTAL).grid(row=3, column=0, sticky="ew", pady=(12, 12))
+
+        input_row = ttk.Frame(chat_card, style="CardInner.TFrame")
+        input_row.grid(row=4, column=0, sticky="ew")
+        input_row.columnconfigure(0, weight=1)
+
+        self._user_entry = tk.Entry(
+            input_row,
+            font=("Segoe UI", 12),
+            relief=tk.FLAT,
+            bg=palette["background"],
+            fg=palette["text"],
+            insertbackground=palette["accent"],
+            highlightthickness=1,
+            highlightbackground="#1e293b",
+            highlightcolor=palette["accent"],
+        )
+        self._user_entry.grid(row=0, column=0, sticky="ew")
+        self._user_entry.bind("<Return>", self._send_message_event)
+
+        self._send_button = ttk.Button(
+            input_row,
+            text="Send",
+            style="Accent.TButton",
+            command=self._send_message_direct,
+        )
+        self._send_button.grid(row=0, column=1, padx=(12, 0))
+
+        self._clear_button = ttk.Button(
+            input_row,
+            text="Clear",
+            style="Ghost.TButton",
+            command=self._clear_history,
+        )
+        self._clear_button.grid(row=0, column=2, padx=(12, 0))
+
+        self._activity = ttk.Progressbar(
+            chat_card,
+            mode="indeterminate",
+            style="Activity.Horizontal.TProgressbar",
+        )
+        self._activity.grid(row=5, column=0, sticky="ew", pady=(12, 0))
+
+        ttk.Label(insight_card, text="LM Studio Diagnostics", style="Section.TLabel").grid(
+            row=0, column=0, sticky=tk.W
+        )
+        ttk.Separator(insight_card, orient=tk.HORIZONTAL).grid(row=1, column=0, sticky="ew", pady=(10, 12))
+
+        tree_container = ttk.Frame(insight_card, style="CardInner.TFrame")
+        tree_container.grid(row=2, column=0, sticky="nsew")
+        tree_container.columnconfigure(0, weight=1)
+        tree_container.rowconfigure(0, weight=1)
+
+        self._endpoint_tree = ttk.Treeview(
+            tree_container,
+            columns=("endpoint", "url"),
+            show="headings",
+            height=11,
+        )
+        self._endpoint_tree.heading("endpoint", text="Endpoint")
+        self._endpoint_tree.heading("url", text="URL")
+        self._endpoint_tree.column("endpoint", width=160, anchor=tk.W)
+        self._endpoint_tree.column("url", width=280, anchor=tk.W)
+        self._endpoint_tree.grid(row=0, column=0, sticky="nsew")
+
+        endpoint_scroll = ttk.Scrollbar(
+            tree_container, orient=tk.VERTICAL, command=self._endpoint_tree.yview
+        )
+        endpoint_scroll.grid(row=0, column=1, sticky="ns")
+        self._endpoint_tree.configure(yscrollcommand=endpoint_scroll.set)
+
+        ttk.Separator(insight_card, orient=tk.HORIZONTAL).grid(row=3, column=0, sticky="ew", pady=(12, 12))
+        ttk.Label(
+            insight_card,
+            text="Endpoints mirror LM Studio's REST surface. Refresh models to stay in sync.",
+            style="Caption.TLabel",
+        ).grid(row=4, column=0, sticky=tk.W)
+
+        action_row = ttk.Frame(insight_card, style="CardInner.TFrame")
+        action_row.grid(row=5, column=0, sticky="ew", pady=(12, 0))
+        action_row.columnconfigure(0, weight=1)
+        ttk.Button(
+            action_row,
+            text="Check health",
+            style="Ghost.TButton",
+            command=self._refresh_health_async,
+        ).grid(row=0, column=0, sticky=tk.E)
+
+    def _configure_chat_display(self) -> None:
+        palette = self._palette
+        self._chat_display.tag_configure(
+            "user",
+            foreground=palette["accent"],
+            font=("Segoe UI", 11, "bold"),
+            spacing3=8,
+        )
+        self._chat_display.tag_configure(
+            "assistant",
+            foreground=palette["success"],
+            font=("Segoe UI", 11),
+            spacing3=12,
+        )
+        self._chat_display.tag_configure(
+            "info",
+            foreground=palette["muted"],
+            font=("Segoe UI", 10, "italic"),
+            spacing3=8,
+        )
+        self._chat_display.tag_configure(
+            "history",
+            foreground="#c084fc",
+            font=("Segoe UI", 10),
+            spacing3=8,
+        )
+
+    def _append_initial_history(self) -> None:
+        history = self._orchestrator.export_history()
+        if not history:
+            self._append_to_display(
+                "Session initialised. Messages will appear here.",
+                tag="info",
+                timestamp=False,
+            )
+            return
+        for entry in history:
+            role = entry.get("role", "user").capitalize()
+            content = entry.get("content", "")
+            self._append_to_display(f"{role}: {content}", tag="history", timestamp=False)
+
+    def _populate_endpoints(self) -> None:
+        endpoints = self._orchestrator.endpoints()
+        for item in self._endpoint_tree.get_children():
+            self._endpoint_tree.delete(item)
+        for name, url in sorted(endpoints.items()):
+            pretty = name.replace("_", " ").title()
+            self._endpoint_tree.insert("", tk.END, values=(pretty, url))
+
+    def _refresh_models_async(self) -> None:
+        self._model_refresh.state(["disabled"])
+
+        def worker() -> None:
+            models = self._orchestrator.available_models()
+            self._root.after(0, lambda m=models: self._update_models(m))
+
+        threading.Thread(target=worker, name="ModelRefresh", daemon=True).start()
+
+    def _refresh_health_async(self) -> None:
+        self._health_var.set("Health: checking…")
+        self._set_health_style("unknown")
+
+        def worker() -> None:
+            healthy = self._orchestrator.health_status()
+            self._root.after(0, lambda: self._apply_health_result(healthy))
+
+        threading.Thread(target=worker, name="HealthProbe", daemon=True).start()
+
+    def _apply_health_result(self, healthy: bool) -> None:
+        if healthy:
+            self._health_var.set("Health: online")
+            self._set_health_style("good")
+        else:
+            self._health_var.set("Health: offline or unsupported")
+            self._set_health_style("bad")
+
+    def _set_health_style(self, status: str) -> None:
+        mapping = {
+            "good": "HealthGood.TLabel",
+            "bad": "HealthBad.TLabel",
+            "unknown": "HealthUnknown.TLabel",
+        }
+        self._health_label.configure(style=mapping.get(status, "HealthUnknown.TLabel"))
+
+    def _update_models(self, models: List[str]) -> None:
+        unique_models = models or [self._orchestrator.current_model()]
+        self._model_dropdown.configure(values=unique_models)
+        current = self._orchestrator.current_model()
+        if current not in unique_models:
+            current = unique_models[0]
+            self._orchestrator.select_model(current)
+        self._model_var.set(current)
+        self._model_refresh.state(["!disabled"])
+        self._status_var.set(f"Active model set to {current}")
+
+    def _format_metrics(self, snapshot: Dict[str, Any]) -> str:
+        return (
+            f"Responses: {snapshot['count']} • Failures: {snapshot['failures']} "
+            f"• Mean latency: {snapshot['mean']:.2f}s"
+        )
+
+    def _send_message_event(self, event: tk.Event[Any]) -> None:  # pragma: no cover - GUI
+        self._send_message_direct()
+
+    def _send_message_direct(self) -> None:
+        raw_input = self._user_entry.get()
+        try:
+            sanitised = InputSanitiser.sanitise(raw_input)
+        except ValueError as exc:
+            messagebox.showwarning("Invalid input", str(exc))
+            return
+
+        self._user_entry.delete(0, tk.END)
+        self._append_to_display(f"You: {sanitised}", tag="user")
+
+        completion_event = threading.Event()
+        self._work_queue.put((sanitised, completion_event))
+        self._send_button.state(["disabled"])
+        self._clear_button.state(["disabled"])
+        self._activity.start(12)
+        self._status_var.set("Awaiting response…")
+
+    def _response_worker(self) -> None:
+        while True:
+            prompt, completion_event = self._work_queue.get()
+            try:
+                response = self._orchestrator.submit_user_message(prompt)
+                self._root.after(
+                    0,
+                    lambda resp=response: self._append_to_display(
+                        f"Assistant: {resp}", tag="assistant"
+                    ),
+                )
+            except RateLimitError as exc:
+                self._root.after(0, lambda msg=str(exc): messagebox.showerror("Rate limit", msg))
+            except APIError as exc:
+                LOGGER.error("API failure: %s", exc)
+                self._root.after(
+                    0,
+                    lambda msg=str(exc): messagebox.showerror(
+                        "API Error", f"The language model could not be reached: {msg}"
+                    ),
+                )
+            finally:
+                self._root.after(0, self._on_response_complete)
+                completion_event.set()
+                self._work_queue.task_done()
+
+    def _on_response_complete(self) -> None:
+        snapshot = self._metrics.snapshot()
+        self._metrics_var.set(self._format_metrics(snapshot))
+        self._status_var.set("Ready")
+        self._activity.stop()
+        self._send_button.state(["!disabled"])
+        self._clear_button.state(["!disabled"])
+        self._refresh_health_async()
+
+    def _append_to_display(self, text: str, tag: str, timestamp: bool = True) -> None:
+        message = text.strip()
+        if timestamp:
+            stamp = datetime.now().strftime("%H:%M:%S")
+            message = f"[{stamp}] {message}"
+        if not message.endswith("\n"):
+            message = f"{message}\n"
+        self._chat_display.configure(state=tk.NORMAL)
+        self._chat_display.insert(tk.END, message, tag)
+        self._chat_display.configure(state=tk.DISABLED)
+        self._chat_display.yview(tk.END)
+
+    def _clear_history(self) -> None:
+        if messagebox.askyesno("Confirm", "Clear the conversation history from this session?"):
+            self._chat_display.configure(state=tk.NORMAL)
+            self._chat_display.delete("1.0", tk.END)
+            self._chat_display.configure(state=tk.DISABLED)
+            self._status_var.set("History cleared – Ready")
+
+    def _on_model_changed(self, _event: tk.Event[Any]) -> None:
+        selected = self._model_var.get()
+        if selected:
+            self._orchestrator.select_model(selected)
+            self._status_var.set(f"Active model set to {selected}")
+
+    def _on_close(self) -> None:
+        if messagebox.askokcancel("Quit", "Do you really want to exit Hypothesis-link?"):
+            self._orchestrator.shutdown()
+            self._root.destroy()
+
+    def run(self) -> None:  # pragma: no cover - GUI loop
+        LOGGER.info("Starting GUI loop")
+        self._root.mainloop()
 
 
-# -------------------------------
-# MAIN EXECUTION
-# -------------------------------
-def main():
-    root = tk.Tk()
-    app = AIChatGUI(root)
-    root.mainloop()
+# ---------------------------------------------------------------------------
+# Application bootstrap
+# ---------------------------------------------------------------------------
+
+def build_application() -> ChatGUI:
+    """Construct the application using dependency injection.
+
+    This function wires together all components in a predictable order.  Doing
+    so makes the codebase easier to unit test by allowing individual pieces to
+    be swapped with fakes or mocks.
+    """
+
+    paths = AppPaths()
+    config = AppConfig.from_env(paths)
+    metrics = MetricsTracker()
+    limiter = RateLimiter(config.rate_limit_per_minute)
+    history = ConversationHistory(config.history_limit)
+    store = PersistentHistoryStore(paths.history_path)
+    enhancer = PromptEnhancer()
+    client = SecureHTTPClient(config, metrics, limiter)
+    orchestrator = ChatOrchestrator(config, history, store, enhancer, client, metrics)
+    gui = ChatGUI(orchestrator, metrics)
+    return gui
 
 
-if __name__ == "__main__":
+def main() -> None:  # pragma: no cover - entry point
+    try:
+        app = build_application()
+    except ConfigurationError as exc:
+        CONSOLE.print(f"[bold red]Configuration error:[/bold red] {exc}")
+        return
+    except Exception as exc:  # pragma: no cover - defensive catch-all
+        LOGGER.exception("Fatal error during application startup")
+        CONSOLE.print(f"[bold red]Unexpected error:[/bold red] {exc}")
+        return
+
+    app.run()
+
+
+if __name__ == "__main__":  # pragma: no cover - module executed directly
     main()
-

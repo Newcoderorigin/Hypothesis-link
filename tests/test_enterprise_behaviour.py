@@ -122,6 +122,41 @@ class TestSecureHTTPClientBehaviour(unittest.TestCase):
         self.assertEqual(payload["messages"], messages)
         self.assertTrue(session.closed is False)
 
+    def test_chat_completion_switches_to_offline_on_timeout(self) -> None:
+        """Network timeouts should immediately trigger the offline simulator."""
+
+        class TimeoutSession:
+            def __init__(self) -> None:
+                self.headers: Dict[str, str] = {}
+                self.post_calls = 0
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+            def post(self, url: str, json: Dict[str, Any], timeout: float, verify: bool) -> Any:
+                self.post_calls += 1
+                raise app_main.requests.Timeout("Simulated timeout")
+
+            def get(self, url: str, timeout: float, verify: bool) -> Any:
+                return app_main.OfflineResponse(200, {"status": "ok"})
+
+        timeout_session = TimeoutSession()
+        with mock.patch.object(app_main.requests, "Session", return_value=timeout_session):
+            client = app_main.SecureHTTPClient(self.config, self.metrics, self.limiter)
+
+        try:
+            response = client.chat_completion([
+                {"role": "user", "content": "Demonstrate offline recovery"}
+            ])
+        finally:
+            client.close()
+
+        self.assertGreaterEqual(timeout_session.post_calls, 1)
+        self.assertIn("offline-response", response)
+        self.assertTrue(client.using_offline_simulator())
+        self.assertIsNotNone(client.offline_reason)
+
     def test_summarise_http_error_extracts_nested_payload(self) -> None:
         """Nested dictionaries in error responses must be flattened into text."""
 

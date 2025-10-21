@@ -216,6 +216,7 @@ class AppConfig:
     history_limit: int = 32
     rate_limit_per_minute: int = 90
     verify_tls: bool = True
+    offline_fallback_enabled: bool = True
 
     _DEFAULT_BASE_URL: ClassVar[str] = "http://127.0.0.1:1234"
     _DEFAULT_MODEL: ClassVar[str] = "liquid/lfm2-1.2b"
@@ -292,6 +293,11 @@ class AppConfig:
             "history_limit": _read_int("HYPOTHESIS_HISTORY_LIMIT", "history_limit", 32),
             "rate_limit_per_minute": _read_int("HYPOTHESIS_RPM", "rate_limit_per_minute", 90),
             "verify_tls": _read_bool("HYPOTHESIS_VERIFY_TLS", "verify_tls", True),
+            "offline_fallback_enabled": _read_bool(
+                "HYPOTHESIS_OFFLINE_FALLBACK",
+                "offline_fallback_enabled",
+                True,
+            ),
         }
 
         config = cls(**data)
@@ -314,6 +320,8 @@ class AppConfig:
         if self.rate_limit_per_minute < 1:
             raise ConfigurationError("Rate limit must be positive")
         LMStudioEndpoints(self.api_base_url)
+        if not isinstance(self.offline_fallback_enabled, bool):
+            raise ConfigurationError("Offline fallback flag must be boolean")
 
 
 @dataclass(slots=True)
@@ -701,6 +709,7 @@ class SecureHTTPClient:
         self._metrics = metrics
         self._limiter = limiter
         self._session = session or requests.Session()
+        self._custom_session_provided = session is not None
         if not hasattr(self._session, "headers"):
             self._session.headers = {}
         try:
@@ -708,10 +717,96 @@ class SecureHTTPClient:
         except AttributeError:  # pragma: no cover - highly defensive
             self._session.headers["Content-Type"] = "application/json"
         self._lock = threading.Lock()
+        self._offline_reason: Optional[str] = None
         self._endpoints = LMStudioEndpoints(config.api_base_url)
+        if (
+            self._config.offline_fallback_enabled
+            and not self._custom_session_provided
+        ):
+            self._auto_enable_offline_mode()
 
     def close(self) -> None:
         self._session.close()
+
+    def using_offline_simulator(self) -> bool:
+        """Indicate whether requests are served by the offline simulator."""
+
+        return isinstance(self._session, OfflineSession)
+
+    @property
+    def offline_reason(self) -> Optional[str]:
+        """Return the reason the client switched to offline mode, if any."""
+
+        return self._offline_reason
+
+    def _auto_enable_offline_mode(self) -> None:
+        """Run a health probe and enable the offline simulator when required."""
+
+        if self.using_offline_simulator():
+            return
+
+        health_url = self._endpoints.url_for("health")
+        try:
+            response = self._session.get(
+                health_url,
+                timeout=min(self._config.timeout, 3.0),
+                verify=self._config.verify_tls,
+            )
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            self._switch_to_offline_session(f"Health probe failed: {exc}")
+            return
+        except Exception as exc:  # pragma: no cover - defensive guard
+            if not REQUESTS_AVAILABLE:
+                self._switch_to_offline_session(
+                    "The 'requests' package is unavailable; using offline simulator.",
+                )
+            else:
+                LOGGER.debug("Health probe raised unexpected exception: %s", exc)
+            return
+
+        if getattr(response, "ok", False):
+            return
+
+        status = getattr(response, "status_code", None)
+        if status is not None and status >= 500:
+            self._switch_to_offline_session(
+                f"Health probe returned HTTP {status}; enabling offline simulator."
+            )
+
+    def _switch_to_offline_session(self, reason: str) -> None:
+        """Swap the active session with the offline simulator implementation."""
+
+        with self._lock:
+            if self.using_offline_simulator():
+                if self._offline_reason is None:
+                    self._offline_reason = reason
+                return
+
+            LOGGER.warning("Falling back to offline simulator: %s", reason)
+            offline_session = OfflineSession()
+            offline_session.headers.update(getattr(self._session, "headers", {}))
+            offline_session.configure_models(
+                [self._config.model_name, "offline-simulator"]
+            )
+            self._session = offline_session
+            self._offline_reason = reason
+            self._custom_session_provided = False
+            if "offline" not in self._config.api_base_url:
+                self._config.api_base_url = "http://offline.local"
+                self._endpoints = LMStudioEndpoints(self._config.api_base_url)
+
+    def _maybe_failover_to_offline(self, reason: str) -> bool:
+        """Attempt to switch to offline mode, returning True on success."""
+
+        if (
+            not self._config.offline_fallback_enabled
+            or self.using_offline_simulator()
+            or self._custom_session_provided
+        ):
+            return False
+
+        self._switch_to_offline_session(reason)
+        return True
 
     def chat_completion(self, messages: List[Dict[str, str]], temperature: float = 0.7) -> str:
         payload = {
@@ -740,7 +835,12 @@ class SecureHTTPClient:
                 LOGGER.debug("Received response in %.2fs", duration)
                 return reply
             except (requests.Timeout, requests.ConnectionError) as exc:
-                self._metrics.record(time.perf_counter() - start, success=False)
+                duration = time.perf_counter() - start
+                self._metrics.record(duration, success=False)
+                reason = f"Network failure contacting language model: {exc}"
+                if self._maybe_failover_to_offline(reason):
+                    retries = 0
+                    continue
                 if retries >= self._config.max_retries:
                     raise APIError("Network failure contacting language model") from exc
                 retries += 1
@@ -792,6 +892,10 @@ class SecureHTTPClient:
             return models
         except (requests.Timeout, requests.ConnectionError) as exc:
             self._metrics.record(time.perf_counter() - start, success=False)
+            if self._maybe_failover_to_offline(
+                f"Model listing failed due to network error: {exc}"
+            ):
+                return self.list_models()
             raise APIError("Network failure while listing models") from exc
         except requests.HTTPError as exc:
             self._metrics.record(time.perf_counter() - start, success=False)
@@ -1057,6 +1161,7 @@ class ChatOrchestrator:
         self._lock = threading.RLock()
         self._load_history()
         self._synchronise_active_model()
+        self._announce_offline_mode()
 
     def _load_history(self) -> None:
         try:
@@ -1088,6 +1193,12 @@ class ChatOrchestrator:
                 fallback,
             )
             self._config.model_name = fallback
+
+    def _announce_offline_mode(self) -> None:
+        offline, reason = self.offline_status()
+        if offline:
+            detail = reason or "Network connectivity unavailable"
+            LOGGER.info("Offline simulator engaged: %s", detail)
 
     def submit_user_message(self, user_input: str) -> str:
         with self._lock:
@@ -1144,6 +1255,13 @@ class ChatOrchestrator:
     def endpoints(self) -> Dict[str, str]:
         return self._client.available_endpoints()
 
+    def offline_status(self) -> Tuple[bool, Optional[str]]:
+        return (self._client.using_offline_simulator(), self._client.offline_reason)
+
+    def using_offline_mode(self) -> bool:
+        offline, _ = self.offline_status()
+        return offline
+
     def health_status(self) -> bool:
         return self._client.check_health()
 
@@ -1196,6 +1314,7 @@ class ChatGUI:
 
         self._populate_endpoints()
         self._append_initial_history()
+        self._announce_offline_status()
         self._refresh_models_async()
         self._refresh_health_async()
 
@@ -1548,6 +1667,18 @@ class ChatGUI:
             content = entry.get("content", "")
             self._append_to_display(f"{role}: {content}", tag="history", timestamp=False)
         self._status_var.set("History loaded")
+
+    def _announce_offline_status(self) -> None:
+        offline, reason = self._orchestrator.offline_status()
+        if not offline:
+            return
+        detail = reason or "Network connectivity to the LM backend is unavailable."
+        self._append_to_display(
+            f"Offline simulator active. {detail}",
+            tag="info",
+            timestamp=False,
+        )
+        self._status_var.set("Offline simulator active")
 
     def _populate_endpoints(self) -> None:
         endpoints = self._orchestrator.endpoints()

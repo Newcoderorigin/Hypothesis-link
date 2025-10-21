@@ -583,6 +583,7 @@ class PersistentHistoryStore:
 
 class PromptEnhancer:
     """A prompt handler that preserves user intent for the language model."""
+    """A deterministic, lightweight prompt improvement engine."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -610,6 +611,65 @@ class PromptEnhancer:
             if self._last_prompt is None:
                 return None
             return (self._last_prompt, self._last_response)
+    def _augment_with_context(self, text: str, context: ConversationHistory) -> str:
+        summary_terms: List[str] = []
+        for message in reversed(context.export()):
+            if message["role"] != "assistant":
+                continue
+            terms = self._extract_keywords(message["content"])
+            for term in terms:
+                if term not in summary_terms:
+                    summary_terms.append(term)
+                if len(summary_terms) >= 4:
+                    break
+            if len(summary_terms) >= 4:
+                break
+
+        if summary_terms:
+            joined = ", ".join(summary_terms)
+            return f"{text} (Consider continuity with: {joined}.)"
+        return text
+
+    def _remember_keywords(self, text: str) -> None:
+        keywords = self._extract_keywords(text)
+        for word in keywords:
+            self._observed_keywords[word] = self._observed_keywords.get(word, 0) + 1
+        if len(self._observed_keywords) > self._max_keywords:
+            least_common = min(self._observed_keywords.items(), key=lambda item: item[1])[0]
+            self._observed_keywords.pop(least_common, None)
+
+    def _add_quality_instructions(self, text: str) -> str:
+        word_count = len(text.split())
+        if word_count < 8:
+            return (
+                f"{text} Please provide a detailed, structured explanation "
+                "including numbered steps and relevant caveats."
+            )
+        if word_count < 20 and self._observed_keywords:
+            emphasised = ", ".join(sorted(self._observed_keywords.keys())[:3])
+            return (
+                f"{text} Ensure the answer references the following key themes: "
+                f"{emphasised}."
+            )
+        return text
+
+    @staticmethod
+    def _extract_keywords(text: str) -> List[str]:
+        text = text.lower()
+        candidates = re.findall(r"[a-zA-Z]{4,}", text)
+        stopwords = {"this", "that", "have", "with", "from", "about", "which"}
+        return [word for word in candidates if word not in stopwords]
+
+    def register_feedback(self, prompt: str, response: str) -> None:
+        with self._lock:
+            positive_terms = self._extract_keywords(f"{prompt} {response}")
+            for term in positive_terms:
+                self._observed_keywords[term] = self._observed_keywords.get(term, 0) + 2
+            if len(self._observed_keywords) > self._max_keywords:
+                sorted_terms = sorted(
+                    self._observed_keywords.items(), key=lambda item: item[1], reverse=True
+                )
+                self._observed_keywords = dict(sorted_terms[: self._max_keywords])
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +718,7 @@ class SecureHTTPClient:
             try:
                 response = self._session.post(
                     self._endpoints.url_for("chat_completions"),
+                    self._endpoints.chat_completions,
                     json=payload,
                     timeout=self._config.timeout,
                     verify=self._config.verify_tls,
@@ -1570,6 +1631,7 @@ def run_offline_self_test(rounds: int = 3) -> None:
     finally:
         orchestrator.shutdown()
         temp_history_path.unlink(missing_ok=True)
+
 
 
 def build_application() -> ChatGUI:
